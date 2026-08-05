@@ -41,17 +41,43 @@ const receiveRowSchema = z
 export const stockRouter = Router();
 stockRouter.use(requireAuth);
 
-/** Low-stock list — powers the reorder banner. */
+/**
+ * Low-stock list — powers the reorder banner, so it runs on a hot path.
+ *
+ * The comparison happens in SQL. It used to hydrate every tracked product with
+ * a threshold and filter in Node, which means a supermarket with 50k SKUs
+ * loaded 50k rows to show a banner listing eleven of them.
+ */
 stockRouter.get(
   '/low',
+  validate({ query: z.object({ limit: z.coerce.number().int().min(1).max(500).default(200) }) }),
   asyncHandler(async (req, res) => {
     const { orgId } = req.auth!;
-    const products = await prisma.product.findMany({
-      where: { orgId, deletedAt: null, isActive: true, trackStock: true, NOT: { lowStockAt: null } },
-      select: { id: true, name: true, stockQty: true, lowStockAt: true, unit: true },
-      orderBy: { stockQty: 'asc' },
-    });
-    ok(res, products.filter((p) => p.lowStockAt !== null && p.stockQty.lte(p.lowStockAt)));
+    const rows = await prisma.$queryRaw<
+      Array<{ id: string; name: string; stockQty: string; lowStockAt: string; unit: string }>
+    >`
+      SELECT id, name, stockQty, lowStockAt, unit
+      FROM products
+      WHERE orgId = ${orgId}
+        AND deletedAt IS NULL
+        AND isActive = 1
+        AND trackStock = 1
+        AND lowStockAt IS NOT NULL
+        AND stockQty <= lowStockAt
+      ORDER BY stockQty ASC
+      LIMIT ${Number(req.query.limit)}
+    `;
+
+    ok(
+      res,
+      rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        stockQty: Number(r.stockQty),
+        lowStockAt: Number(r.lowStockAt),
+        unit: r.unit,
+      })),
+    );
   }),
 );
 

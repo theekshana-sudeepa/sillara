@@ -14,6 +14,7 @@ import { postStock, resolveBranchId } from '../../domain/stock.js';
 import { resolveSaleRefs } from '../../domain/tenancy.js';
 import { settle, settleLegacy } from '../../domain/payments.js';
 import { postCredit, creditPortion } from '../../domain/credit.js';
+import { localDay, localDayOf } from '../../lib/time.js';
 import { computeTotals, resolveTaxRate } from '../../lib/tax.js';
 
 /**
@@ -89,8 +90,8 @@ const syncSchema = z.object({
 async function nextSaleNumber(orgId: string, tx: Prisma.TransactionClient): Promise<number> {
   await tx.$executeRaw`
     INSERT INTO org_sequences (orgId, scope, current, updatedAt)
-    VALUES (${orgId}, 'sale', LAST_INSERT_ID(1), NOW(3))
-    ON DUPLICATE KEY UPDATE current = LAST_INSERT_ID(current + 1), updatedAt = NOW(3)
+    VALUES (${orgId}, 'sale', LAST_INSERT_ID(1), UTC_TIMESTAMP(3))
+    ON DUPLICATE KEY UPDATE current = LAST_INSERT_ID(current + 1), updatedAt = UTC_TIMESTAMP(3)
   `;
   const rows = await tx.$queryRaw<Array<{ seq: bigint }>>`SELECT LAST_INSERT_ID() AS seq`;
   return Number(rows[0]?.seq ?? 0);
@@ -406,15 +407,25 @@ salesRouter.get(
   }),
 );
 
-/** Daily Z-report — the number every shop owner checks before locking up. */
+/**
+ * Daily Z-report — the number every shop owner checks before locking up.
+ *
+ * The day is the shop's day. This used to cut it on UTC midnight, so a Colombo
+ * shop's "today" ran 05:30 to 05:30 and their whole evening — the busiest part
+ * of the trade — landed in tomorrow's figure. Wrong for every tenant outside
+ * UTC, which is every tenant in the launch market. `lib/time.ts` and the
+ * digest job always did this correctly; this endpoint simply never used them.
+ */
 salesRouter.get(
   '/z-report',
-  validate({ query: z.object({ date: z.coerce.date().optional() }) }),
+  validate({ query: z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() }) }),
   asyncHandler(async (req, res) => {
     const { orgId } = req.auth!;
-    const date = (req.query.date as unknown as Date | undefined) ?? new Date();
-    const dayStart = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
-    const dayEnd = new Date(dayStart.getTime() + 86_400_000);
+    const timezone = req.org?.timezone ?? 'UTC';
+    const requested = (req.query as { date?: string }).date;
+    const day = requested ? localDayOf(timezone, requested) : localDay(timezone, new Date());
+    const dayStart = day.start;
+    const dayEnd = day.end;
 
     const [agg, byTender, count, topItems] = await prisma.$transaction([
       prisma.sale.aggregate({
@@ -443,7 +454,8 @@ salesRouter.get(
     ]);
 
     ok(res, {
-      date: dayStart.toISOString().slice(0, 10),
+      date: day.date,
+      timezone,
       salesCount: count,
       gross: toNumber(agg._sum.total),
       discounts: toNumber(agg._sum.discount),

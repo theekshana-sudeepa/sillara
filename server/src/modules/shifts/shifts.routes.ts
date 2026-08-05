@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { prisma } from '../../lib/prisma.js';
+import { prisma, isUniqueViolation } from '../../lib/prisma.js';
 import { asyncHandler, ok } from '../../lib/http.js';
 import { validate } from '../../middleware/validate.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
@@ -60,11 +60,6 @@ shiftsRouter.post(
       note?: string;
     };
 
-    const existing = await prisma.shift.findFirst({
-      where: { orgId, status: 'OPEN', registerId: registerId ?? null },
-    });
-    if (existing) throw Conflict('A shift is already open on this register — close it first');
-
     const shift = await prisma.$transaction(async (tx) => {
       // Same branch resolution as a sale: default when unspecified, and proven
       // to belong to this org when it is. A shift left on a null branch while
@@ -76,11 +71,22 @@ shiftsRouter.post(
           orgId,
           registerId: registerId ?? null,
           branchId: branch,
+          // Populated only while open — UNIQUE(orgId, openRegisterKey) is what
+          // actually prevents a second drawer on the same register. The
+          // sentinel keeps the rule applying to tills that have no register.
+          openRegisterKey: registerId ?? '__no_register__',
           openingFloat: money(openingFloat),
           openedById: userId,
           note: note ?? null,
         },
       });
+    }).catch((err: unknown) => {
+      // Lost the race rather than checked-and-lost it: the database refused
+      // the second insert, so only one drawer is ever open.
+      if (isUniqueViolation(err)) {
+        throw Conflict('A shift is already open on this register — close it first');
+      }
+      throw err;
     });
 
     logger.info({ orgId, shiftId: shift.id }, 'shift opened');
@@ -124,6 +130,8 @@ shiftsRouter.post(
       where: { id: req.params.id! },
       data: {
         status: 'CLOSED',
+        // Frees the register for the next shift — see the UNIQUE index.
+        openRegisterKey: null,
         expectedCash: money(expected),
         countedCash: money(countedCash),
         variance: money(variance),

@@ -661,11 +661,21 @@ model Shift {
   closedAt   DateTime?
   note       String?   @db.VarChar(255)
 
+  /// The uniqueness key for "one open shift per register", maintained by the
+  /// database as a generated column: the register id while OPEN, NULL once
+  /// CLOSED. MySQL has no partial indexes and treats NULLs as distinct, so a
+  /// UNIQUE over this permits any number of closed shifts and exactly one open
+  /// one. Two tills opening a drawer at the same moment used to both succeed —
+  /// a check-then-create with nothing underneath it — and the day's sales then
+  /// split across two shifts that each counted the wrong cash.
+  openRegisterKey String? @db.VarChar(191)
+
   org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
   branch   Branch?      @relation(fields: [branchId], references: [id], onDelete: SetNull)
   register Register?    @relation(fields: [registerId], references: [id], onDelete: SetNull)
   sales    Sale[]
 
+  @@unique([orgId, openRegisterKey], name: "uniq_open_shift_per_register")
   @@index([orgId, status])
   @@index([orgId, openedAt])
   @@map("shifts")
@@ -949,6 +959,26 @@ model JobRun {
   @@unique([jobName, runKey], name: "uniq_job_run")
   @@index([jobName, startedAt])
   @@map("job_runs")
+}
+
+/// Rate-limit counters, shared across instances.
+///
+/// `express-rate-limit`'s default store is a Map in one process. Under PM2
+/// cluster every worker keeps its own, so a limit of 20 is really 20×workers
+/// and resets to zero on every deploy — which is exactly the moment an abuse
+/// surface is least protected.
+///
+/// Only the abuse surfaces use this (signup, login, magic links, PIN switch).
+/// The global limiter stays in memory on purpose: a database round-trip on
+/// every request would put a write on the sell path to buy coarse protection
+/// that belongs at the edge anyway.
+model RateLimitHit {
+  key       String   @id @db.VarChar(191)
+  count     Int      @default(0)
+  expiresAt DateTime
+
+  @@index([expiresAt])
+  @@map("rate_limit_hits")
 }
 
 enum EmailStatus {

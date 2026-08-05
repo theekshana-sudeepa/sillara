@@ -6,6 +6,7 @@ import { asyncHandler, ok } from '../../lib/http.js';
 import { validate } from '../../middleware/validate.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { toNumber } from '../../lib/money.js';
+import { localDay, localDateString, localTimeString } from '../../lib/time.js';
 
 /**
  * Reports & exports.
@@ -66,12 +67,16 @@ reportsRouter.get(
       },
     });
 
+    // Dates in the shop's timezone. An accountant reconciling a Colombo
+    // evening against a file that stamps it as the following day at 04:00 has
+    // to redo the whole reconciliation by hand.
+    const tz = req.org?.timezone ?? 'UTC';
     const csv = toCsv(
       ['Receipt', 'Date', 'Time', 'Branch', 'Cashier', 'Customer', 'Status', 'Subtotal', 'Discount', 'Loyalty', 'Tax', 'Total', 'Tender'],
       sales.map((s) => [
         s.number,
-        s.soldAt.toISOString().slice(0, 10),
-        s.soldAt.toISOString().slice(11, 19),
+        localDateString(tz, s.soldAt),
+        localTimeString(tz, s.soldAt),
         s.branch?.name ?? '',
         s.cashier?.name ?? '',
         s.customer?.name ?? '',
@@ -84,7 +89,7 @@ reportsRouter.get(
         s.tender,
       ]),
     );
-    sendCsv(res, `sillara-sales-${new Date().toISOString().slice(0, 10)}.csv`, csv);
+    sendCsv(res, `sillara-sales-${localDateString(req.org?.timezone ?? 'UTC', new Date())}.csv`, csv);
   }),
 );
 
@@ -114,14 +119,14 @@ reportsRouter.get(
       ['Receipt', 'Date', 'Product', 'Qty', 'Unit price', 'Line total'],
       items.map((i) => [
         i.sale.number,
-        i.sale.soldAt.toISOString().slice(0, 10),
+        localDateString(req.org?.timezone ?? 'UTC', i.sale.soldAt),
         i.nameSnapshot,
         toNumber(i.qty),
         toNumber(i.unitPrice),
         toNumber(i.lineTotal),
       ]),
     );
-    sendCsv(res, `sillara-items-${new Date().toISOString().slice(0, 10)}.csv`, csv);
+    sendCsv(res, `sillara-items-${localDateString(req.org?.timezone ?? 'UTC', new Date())}.csv`, csv);
   }),
 );
 
@@ -151,7 +156,7 @@ reportsRouter.get(
         p.trackStock ? 'yes' : 'no',
       ]),
     );
-    sendCsv(res, `sillara-stock-${new Date().toISOString().slice(0, 10)}.csv`, csv);
+    sendCsv(res, `sillara-stock-${localDateString(req.org?.timezone ?? 'UTC', new Date())}.csv`, csv);
   }),
 );
 
@@ -193,7 +198,10 @@ reportsRouter.get(
   asyncHandler(async (req, res) => {
     const { orgId } = req.auth!;
     const q = req.query as unknown as { days: number; branchId?: string };
-    const since = new Date(Date.now() - q.days * 86_400_000);
+    // Whole trading days in the shop's timezone, not a rolling 24×N hours.
+    // "Last 7 days" should mean seven of their days, ending tonight.
+    const timezone = req.org?.timezone ?? 'UTC';
+    const since = localDay(timezone, new Date(), -(q.days - 1)).start;
     const branchFilter = q.branchId ? Prisma.sql`AND s.branchId = ${q.branchId}` : Prisma.empty;
 
     // Totals over every line in the window — not just the ones we display.
@@ -242,6 +250,8 @@ reportsRouter.get(
 
     ok(res, {
       days: q.days,
+      timezone,
+      from: since.toISOString(),
       revenue,
       cost,
       profit: round(revenue - cost),

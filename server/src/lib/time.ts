@@ -58,6 +58,32 @@ export function localDay(timeZone: string, now: Date, offsetDays = 0): DayRange 
   return { start, end, date: new Date(midnightLocal).toISOString().slice(0, 10) };
 }
 
+/**
+ * The org-local day for a specific calendar date, e.g. "2026-08-01".
+ *
+ * `localDay` answers "what day is it there now?"; this answers "when did their
+ * 1st of August begin and end?", which is what a report for a named date needs.
+ * Same single-sample offset approach, same DST caveat.
+ */
+export function localDayOf(timeZone: string, isoDate: string): DayRange {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const midnightUtc = Date.UTC(y ?? 1970, (m ?? 1) - 1, d ?? 1);
+  const offset = tzOffsetMs(timeZone, new Date(midnightUtc));
+  const start = new Date(midnightUtc - offset);
+
+  return { start, end: new Date(start.getTime() + 86_400_000), date: isoDate };
+}
+
+/** The org-local calendar date of a UTC instant — what a receipt should show. */
+export function localDateString(timeZone: string, at: Date): string {
+  return new Date(at.getTime() + tzOffsetMs(timeZone, at)).toISOString().slice(0, 10);
+}
+
+/** The org-local wall-clock time of a UTC instant, "14:32:05". */
+export function localTimeString(timeZone: string, at: Date): string {
+  return new Date(at.getTime() + tzOffsetMs(timeZone, at)).toISOString().slice(11, 19);
+}
+
 /** "1 August 2026" in the org's language — the subject line of the digest. */
 export function formatDayLabel(date: string, locale = 'en-GB'): string {
   const [y, m, d] = date.split('-').map(Number);
