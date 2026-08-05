@@ -1,0 +1,270 @@
+@import 'tailwindcss';
+
+/* ---------------------------------------------------------------------------
+   SILLARA — terminal design system
+   ---------------------------------------------------------------------------
+   A cashier looks at this screen for eight hours in changing light, at arm's
+   length, while a customer waits. Every decision below serves that:
+
+   • SURFACES LAYER. Background → panel → card → raised. Depth tells the eye
+     what is content and what is chrome without reading a single word.
+   • MONEY DOMINATES. Totals get the largest type on the screen and tabular
+     figures, so digits never shift as they change.
+   • TOUCH IS 48px MINIMUM. 56px for anything that takes money. A mis-tap at
+     the till costs a refund and an apology.
+   • NEUTRALS CARRY A VIOLET BIAS. A pure grey next to indigo reads as dirty;
+     these are mixed toward the accent so the whole screen looks composed.
+--------------------------------------------------------------------------- */
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  /* --- surfaces: each step rises toward the viewer --------------------- */
+  --background: 240 20% 97%;
+  --surface: 0 0% 100%;
+  --card: 0 0% 100%;
+  --raised: 0 0% 100%;
+  --secondary: 240 20% 95%;
+  --secondary-hover: 240 18% 92%;
+
+  /* --- text ------------------------------------------------------------ */
+  --foreground: 240 24% 10%;
+  --muted-foreground: 240 8% 46%;
+  --subtle-foreground: 240 8% 60%;
+
+  /* --- brand ----------------------------------------------------------- */
+  --primary: 243 75% 59%;
+  --primary-hover: 243 70% 53%;
+  --primary-foreground: 0 0% 100%;
+  --primary-soft: 243 75% 59% / 0.1;
+
+  /* --- semantic: separate from brand, never decorative ----------------- */
+  --success: 152 62% 36%;
+  --success-foreground: 0 0% 100%;
+  --warning: 32 92% 44%;
+  --destructive: 0 72% 51%;
+  --info: 217 85% 55%;
+
+  /* --- lines ----------------------------------------------------------- */
+  --border: 240 16% 89%;
+  --border-strong: 240 14% 82%;
+  --input: 240 16% 87%;
+  --ring: 243 75% 59%;
+
+  /* --- elevation ------------------------------------------------------- */
+  --shadow-sm: 0 1px 2px 0 hsl(240 30% 20% / 0.06);
+  --shadow-md: 0 2px 4px -1px hsl(240 30% 20% / 0.07), 0 4px 12px -2px hsl(240 30% 20% / 0.08);
+  --shadow-lg: 0 8px 24px -6px hsl(240 30% 20% / 0.14), 0 2px 6px -2px hsl(240 30% 20% / 0.08);
+  --shadow-sheet: 0 -8px 40px -8px hsl(240 40% 12% / 0.24);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: 240 24% 6%;
+    --surface: 240 22% 9%;
+    --card: 240 20% 11%;
+    --raised: 240 19% 14%;
+    --secondary: 240 17% 17%;
+    --secondary-hover: 240 16% 21%;
+
+    --foreground: 240 30% 96%;
+    --muted-foreground: 240 10% 66%;
+    --subtle-foreground: 240 9% 52%;
+
+    --primary: 243 85% 70%;
+    --primary-hover: 243 88% 76%;
+    --primary-foreground: 240 40% 10%;
+    --primary-soft: 243 85% 70% / 0.14;
+
+    --success: 152 62% 50%;
+    --success-foreground: 240 40% 8%;
+    --warning: 38 94% 60%;
+    --destructive: 0 82% 66%;
+    --info: 217 90% 68%;
+
+    --border: 240 16% 18%;
+    --border-strong: 240 15% 26%;
+    --input: 240 16% 22%;
+    --ring: 243 85% 70%;
+
+    --shadow-sm: 0 1px 2px 0 hsl(240 60% 2% / 0.4);
+    --shadow-md: 0 2px 4px -1px hsl(240 60% 2% / 0.45), 0 4px 14px -2px hsl(240 60% 2% / 0.5);
+    --shadow-lg: 0 10px 30px -8px hsl(240 60% 2% / 0.6), 0 2px 8px -2px hsl(240 60% 2% / 0.45);
+    --shadow-sheet: 0 -10px 50px -10px hsl(240 70% 1% / 0.7);
+  }
+}
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-surface: hsl(var(--surface));
+  --color-card: hsl(var(--card));
+  --color-raised: hsl(var(--raised));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-hover: hsl(var(--secondary-hover));
+
+  --color-foreground: hsl(var(--foreground));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-subtle-foreground: hsl(var(--subtle-foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-hover: hsl(var(--primary-hover));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-success: hsl(var(--success));
+  --color-success-foreground: hsl(var(--success-foreground));
+  --color-warning: hsl(var(--warning));
+  --color-destructive: hsl(var(--destructive));
+  --color-info: hsl(var(--info));
+
+  --color-border: hsl(var(--border));
+  --color-border-strong: hsl(var(--border-strong));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --shadow-e1: var(--shadow-sm);
+  --shadow-e2: var(--shadow-md);
+  --shadow-e3: var(--shadow-lg);
+
+  --font-sans:
+    ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto,
+    'Noto Sans Sinhala', 'Noto Sans Tamil', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, 'Cascadia Mono', Menlo, monospace;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: 'cv02', 'cv03', 'cv04';
+  }
+
+  /* Digits must never shift width as a total counts up. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum' 1;
+  }
+
+  /* Money is the most-read thing on the screen — give it its own treatment. */
+  .money {
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+    font-feature-settings: 'tnum' 1;
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2;
+    --tw-ring-offset-color: hsl(var(--background));
+  }
+
+  button {
+    touch-action: manipulation; /* kill the 300ms tap-delay ghosts */
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.25);
+  }
+
+  /* A scrollbar the width of a finger is a scrollbar in the way. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border-strong));
+    border-radius: 99px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  /* ---- the press feel of a physical key ------------------------------- */
+  .pressable {
+    transition:
+      transform 120ms cubic-bezier(0.2, 0, 0.2, 1),
+      background-color 120ms ease,
+      border-color 120ms ease,
+      box-shadow 120ms ease;
+  }
+  .pressable:active:not(:disabled) {
+    transform: scale(0.975);
+  }
+
+  /* ---- the sheet that carries a payment ------------------------------- */
+  .sheet-in {
+    animation: sheet-in 260ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .scrim-in {
+    animation: fade-in 180ms ease-out;
+  }
+  .rise-in {
+    animation: rise-in 220ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
+
+@keyframes sheet-in {
+  from {
+    transform: translateY(14px);
+    opacity: 0;
+  }
+}
+@keyframes rise-in {
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .pressable:active:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* 80mm thermal receipt printing */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .receipt-paper,
+  .receipt-paper * {
+    visibility: visible;
+  }
+  .receipt-paper {
+    position: fixed;
+    inset: 0 auto auto 0;
+    width: 80mm;
+    padding: 4mm;
+    background: #fff !important;
+    color: #000 !important;
+    font-size: 11px;
+  }
+  .no-print {
+    display: none !important;
+  }
+}

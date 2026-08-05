@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sillara for suppliers — sell to every shop on the network</title>
+<meta name="description" content="List your price list free. Shops order from you inside Sillara, and you see what the shops near you are running low on. No commission, no contract.">
+<meta property="og:title" content="Sillara for suppliers">
+<meta property="og:description" content="Get orders from shops in your area — and see what they're running low on before they call you.">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234F46E5'/%3E%3Cpath d='M21.5 11c0-2-1.8-3.5-5.5-3.5S10.5 9 10.5 11s2 2.8 5.5 3.5 5.5 1.5 5.5 3.5-1.8 3.5-5.5 3.5-5.5-1.5-5.5-3.5' stroke='%23fff' stroke-width='2.4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root { --ink:#0F172A; --muted:#64748B; --line:#E2E8F0; --soft:#F8FAFC; --brand:#4F46E5; --brand-dark:#4338CA; --green:#10B981; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif; color:var(--ink); line-height:1.6; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:900px; margin:0 auto; padding:0 20px; }
+  nav { border-bottom:1px solid var(--line); }
+  .nav-inner { display:flex; align-items:center; height:64px; }
+  .logo { display:flex; align-items:center; gap:10px; font-weight:800; font-size:19px; text-decoration:none; letter-spacing:-.4px; }
+  .logo-mark { width:30px; height:30px; border-radius:8px; background:var(--brand); display:grid; place-items:center; color:#fff; font-size:15px; }
+  .nav-inner a.back { margin-left:auto; font-size:14px; color:var(--muted); text-decoration:none; }
+  header { padding:80px 0 56px; text-align:center; background:radial-gradient(700px 340px at 50% -70px, rgba(79,70,229,.09), transparent); }
+  .eyebrow { display:inline-block; padding:5px 14px; border-radius:999px; background:rgba(16,185,129,.1); color:var(--green); font-size:13px; font-weight:700; }
+  h1 { font-size:clamp(32px,5.5vw,52px); line-height:1.1; letter-spacing:-1.4px; font-weight:800; margin:20px 0 16px; }
+  header p.sub { max-width:560px; margin:0 auto; font-size:18px; color:var(--muted); }
+  section { padding:56px 0; }
+  h2 { text-align:center; font-size:clamp(24px,4vw,34px); letter-spacing:-.7px; margin-bottom:36px; }
+  .grid3 { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:16px; }
+  .card { border:1px solid var(--line); border-radius:16px; padding:24px; }
+  .card .emoji { font-size:26px; }
+  .card h3 { margin:10px 0 6px; font-size:17px; }
+  .card p { font-size:14.5px; color:var(--muted); }
+  #join { background:var(--soft); }
+  form { max-width:440px; margin:0 auto; }
+  label { display:block; font-size:12.5px; font-weight:700; color:var(--muted); margin:14px 0 4px; }
+  input, select, textarea { width:100%; border:1.5px solid var(--line); border-radius:10px; padding:12px 14px; font-size:15px; outline:none; font-family:inherit; background:#fff; }
+  input:focus, select:focus, textarea:focus { border-color:var(--brand); }
+  .btn { display:block; width:100%; margin-top:20px; padding:14px; border:none; border-radius:10px; background:var(--brand); color:#fff; font-size:15px; font-weight:700; cursor:pointer; }
+  .btn:hover { background:var(--brand-dark); }
+  .btn:disabled { opacity:.6; cursor:default; }
+  .msg { margin-top:14px; padding:12px 14px; border-radius:10px; font-size:14px; display:none; }
+  .msg.ok { display:block; background:rgba(16,185,129,.1); color:#047857; }
+  .msg.err { display:block; background:rgba(239,68,68,.1); color:#B91C1C; }
+  .note { margin-top:12px; font-size:12.5px; color:var(--muted); text-align:center; }
+  footer { border-top:1px solid var(--line); padding:32px 0; font-size:13.5px; color:var(--muted); text-align:center; }
+</style>
+</head>
+<body>
+
+<nav><div class="wrap nav-inner">
+  <a class="logo" href="/"><span class="logo-mark">S</span>Sillara</a>
+  <a class="back" href="/">For shops →</a>
+</div></nav>
+
+<header>
+  <div class="wrap">
+    <span class="eyebrow">Free listing · no commission · no contract</span>
+    <h1>Sell to every shop<br>on the network</h1>
+    <p class="sub">Shops using Sillara order from you inside the app they already run their till on.
+       You see the orders, and you see what the shops near you are running low on — before they call.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Why list with us</h2>
+    <div class="grid3">
+      <div class="card"><span class="emoji">📦</span><h3>Orders arrive ready</h3>
+        <p>Item, quantity, delivery address and phone — no phone calls, no misheard quantities, no WhatsApp photos of handwritten lists.</p></div>
+      <div class="card"><span class="emoji">📊</span><h3>See demand before it's a call</h3>
+        <p>Your portal shows which of your items shops are running low on right now, aggregated across everyone connected to you.</p></div>
+      <div class="card"><span class="emoji">🏷️</span><h3>Your prices, your rules</h3>
+        <p>Publish your own price list with minimum order quantities and pack sizes. Change a price and every shop sees it instantly.</p></div>
+      <div class="card"><span class="emoji">🔐</span><h3>No password to remember</h3>
+        <p>Your portal opens from a private link we email you. Bookmark it — that's the whole login.</p></div>
+      <div class="card"><span class="emoji">🤝</span><h3>Shops stay anonymous in reports</h3>
+        <p>You see what's moving and how widely — never which shop. That boundary is why shops are willing to be on the other side of it.</p></div>
+      <div class="card"><span class="emoji">💸</span><h3>Genuinely free</h3>
+        <p>We don't take a cut of your orders. Sillara makes money from shop subscriptions; the network makes the product worth subscribing to.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="join">
+  <div class="wrap">
+    <h2>List your business</h2>
+    <form id="join-form">
+      <label for="name">Business name</label>
+      <input id="name" name="name" required minlength="2" placeholder="Ceylon Distributors (Pvt) Ltd">
+
+      <label for="email">Email — your portal link goes here</label>
+      <input id="email" name="email" type="email" required placeholder="orders@yourcompany.lk">
+
+      <label for="phone">Phone</label>
+      <input id="phone" name="phone" type="tel" placeholder="+94 11 234 5678">
+
+      <label for="country">Country</label>
+      <select id="country" name="country">
+        <option value="LK" selected>Sri Lanka</option><option value="IN">India</option>
+        <option value="BD">Bangladesh</option><option value="NP">Nepal</option>
+        <option value="PK">Pakistan</option><option value="AE">UAE</option>
+        <option value="KE">Kenya</option><option value="NG">Nigeria</option>
+        <option value="GB">United Kingdom</option><option value="US">United States</option>
+      </select>
+
+      <label for="description">What do you supply?</label>
+      <textarea id="description" name="description" rows="3" placeholder="FMCG, dry goods and beverages across the Western Province"></textarea>
+
+      <button class="btn" id="join-btn" type="submit">Get my portal link →</button>
+      <p class="msg" id="msg" role="status"></p>
+      <p class="note">We'll email a private link. No password to create, nothing to install.</p>
+    </form>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">Sillara · the shop network · <a href="mailto:hello@sillara.com" style="color:inherit;">hello@sillara.com</a></div>
+</footer>
+
+<script>
+  const API = (location.hostname === 'localhost' ? 'http://localhost:4100' : 'https://api.sillara.com') + '/api/v1';
+
+  document.getElementById('join-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('join-btn');
+    const msg = document.getElementById('msg');
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
+    msg.className = 'msg';
+
+    const data = Object.fromEntries(new FormData(e.target).entries());
+    data.currency = data.country === 'LK' ? 'LKR' : 'USD';
+
+    try {
+      const res = await fetch(API + '/supplier/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error?.message || 'Could not register');
+      msg.className = 'msg ok';
+      msg.textContent = '✓ Check your email — your portal link is on its way.';
+      e.target.reset();
+    } catch (error) {
+      msg.className = 'msg err';
+      msg.textContent = error.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Get my portal link →';
+    }
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "packageId": "com.sillara.pos",
+  "host": "app.sillara.com",
+  "name": "Sillara POS",
+  "launcherName": "Sillara",
+  "display": "standalone",
+  "themeColor": "#4F46E5",
+  "navigationColor": "#4F46E5",
+  "backgroundColor": "#0B1120",
+  "startUrl": "/sell",
+  "iconUrl": "https://app.sillara.com/icon-512.png",
+  "maskableIconUrl": "https://app.sillara.com/icon-512-maskable.png",
+  "appVersionName": "1.0.0",
+  "appVersionCode": 1,
+  "shortcuts": [
+    { "name": "Sell", "shortName": "Sell", "url": "/sell" },
+    { "name": "Receive goods", "shortName": "Receive", "url": "/stock" }
+  ],
+  "signingKey": { "path": "./android.keystore", "alias": "sillara" },
+  "enableNotifications": false,
+  "orientation": "any",
+  "fallbackType": "customtabs",
+  "features": {}
+}

@@ -1,0 +1,363 @@
+import { Router } from 'express';
+import { z } from 'zod';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../../lib/prisma.js';
+import { asyncHandler, ok } from '../../lib/http.js';
+import { validate } from '../../middleware/validate.js';
+import { requireAuth, requireRole } from '../../middleware/auth.js';
+import { money } from '../../lib/money.js';
+import { NotFound, PlanLimit, Conflict } from '../../lib/errors.js';
+import { extractInvoiceItems, extractProductsFromImages, shelfieEnabled } from '../../services/shelfie.js';
+import { logger } from '../../lib/logger.js';
+import { postStock, setStockLevel, resolveBranchId } from '../../domain/stock.js';
+
+const productSchema = z.object({
+  name: z.string().trim().min(1, 'Name is required').max(180),
+  categoryId: z.string().cuid().nullable().optional(),
+  sku: z.string().trim().max(60).nullable().optional(),
+  barcode: z.string().trim().max(60).nullable().optional(),
+  price: z.coerce.number().nonnegative(),
+  cost: z.coerce.number().nonnegative().default(0),
+  taxRate: z.coerce.number().min(0).max(100).nullable().optional(),
+  trackStock: z.boolean().default(false),
+  stockQty: z.coerce.number().default(0),
+  lowStockAt: z.coerce.number().nonnegative().nullable().optional(),
+  unit: z.enum(['pc', 'kg', 'g', 'l', 'ml', 'm']).default('pc'),
+  isActive: z.boolean().default(true),
+});
+
+const idParam = z.object({ id: z.string().cuid() });
+
+export const productsRouter = Router();
+productsRouter.use(requireAuth);
+
+/**
+ * The POS bootstrap: full catalog in one call, cached into IndexedDB by the
+ * terminal. Sell screens never wait on the network after this.
+ */
+productsRouter.get(
+  '/bootstrap',
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const [org, categories, products, registers, staff, customers] = await prisma.$transaction([
+      prisma.organization.findUniqueOrThrow({
+        where: { id: orgId },
+        select: {
+          id: true, slug: true, name: true, currency: true, timezone: true, language: true,
+          taxRate: true, taxInclusive: true, receiptHeader: true, receiptFooter: true,
+          address: true, phone: true, taxId: true, status: true, planCode: true,
+        },
+      }),
+      prisma.category.findMany({ where: { orgId, deletedAt: null }, orderBy: { sortOrder: 'asc' } }),
+      prisma.product.findMany({ where: { orgId, deletedAt: null, isActive: true }, orderBy: { name: 'asc' } }),
+      prisma.register.findMany({ where: { orgId, isActive: true } }),
+      prisma.orgUser.findMany({
+        where: { orgId, deletedAt: null, isActive: true },
+        select: { id: true, name: true, role: true },
+      }),
+      prisma.customer.findMany({
+        where: { orgId, deletedAt: null },
+        select: { id: true, name: true, phone: true, loyaltyPoints: true },
+        take: 2000,
+      }),
+    ]);
+    ok(res, { org, categories, products, registers, staff, customers, syncedAt: new Date().toISOString() });
+  }),
+);
+
+productsRouter.get(
+  '/',
+  validate({
+    query: z.object({
+      search: z.string().trim().max(120).optional(),
+      categoryId: z.string().cuid().optional(),
+      lowStock: z.coerce.boolean().optional(),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const q = req.query as { search?: string; categoryId?: string; lowStock?: boolean };
+    const products = await prisma.product.findMany({
+      where: {
+        orgId,
+        deletedAt: null,
+        ...(q.categoryId ? { categoryId: q.categoryId } : {}),
+        ...(q.search
+          ? { OR: [{ name: { contains: q.search } }, { sku: { contains: q.search } }, { barcode: { contains: q.search } }] }
+          : {}),
+      },
+      include: { category: { select: { id: true, name: true, color: true } } },
+      orderBy: { name: 'asc' },
+      take: 500,
+    });
+    const filtered = q.lowStock
+      ? products.filter((p) => p.trackStock && p.lowStockAt !== null && p.stockQty.lte(p.lowStockAt))
+      : products;
+    ok(res, filtered);
+  }),
+);
+
+productsRouter.post(
+  '/',
+  requireRole('MANAGER'),
+  validate({ body: productSchema }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+
+    // Plan enforcement — the FREE tier's product cap is the upgrade trigger.
+    const org = await prisma.organization.findUniqueOrThrow({ where: { id: orgId }, include: { plan: true } });
+    if (org.plan.maxProducts >= 0) {
+      const count = await prisma.product.count({ where: { orgId, deletedAt: null } });
+      if (count >= org.plan.maxProducts) {
+        throw PlanLimit(`The ${org.plan.name} plan allows ${org.plan.maxProducts} products. Upgrade to add more.`);
+      }
+    }
+
+    const body = req.body as z.infer<typeof productSchema>;
+    if (body.sku) {
+      const dupe = await prisma.product.findFirst({ where: { orgId, sku: body.sku, deletedAt: null } });
+      if (dupe) throw Conflict(`SKU ${body.sku} is already used by "${dupe.name}"`);
+    }
+
+    const product = await prisma.$transaction(async (tx) => {
+      const created = await tx.product.create({
+        data: {
+          orgId,
+          ...body,
+          price: money(body.price),
+          cost: money(body.cost),
+          taxRate: body.taxRate === null || body.taxRate === undefined ? null : new Prisma.Decimal(body.taxRate),
+          // Opens empty; the posting below is what puts it on the shelf, so
+          // the ledger explains the balance from the very first row.
+          stockQty: new Prisma.Decimal(0),
+          lowStockAt: body.lowStockAt === null || body.lowStockAt === undefined ? null : new Prisma.Decimal(body.lowStockAt),
+        },
+      });
+
+      if (body.trackStock && body.stockQty !== 0) {
+        const branchId = await resolveBranchId(tx, orgId);
+        await postStock(tx, { orgId, branchId, userId: req.auth!.userId }, [
+          { productId: created.id, qty: body.stockQty, type: 'ADJUST', note: 'Opening stock' },
+        ]);
+        return tx.product.findUniqueOrThrow({ where: { id: created.id } });
+      }
+      return created;
+    });
+
+    ok(res, product, 201);
+  }),
+);
+
+productsRouter.patch(
+  '/:id',
+  requireRole('MANAGER'),
+  validate({ params: idParam, body: productSchema.partial() }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const existing = await prisma.product.findFirst({ where: { id: req.params.id!, orgId, deletedAt: null } });
+    if (!existing) throw NotFound('Product');
+
+    const body = req.body as Partial<z.infer<typeof productSchema>>;
+
+    const product = await prisma.$transaction(async (tx) => {
+      // `stockQty` is deliberately not settable here. Editing a product used
+      // to be a way to change stock with no ledger row and no audit trail —
+      // which is precisely how shrinkage gets quietly written off. A quantity
+      // change is a stocktake (`POST /stock/count`) or an adjustment with a
+      // reason (`POST /stock/adjust`), both of which leave a record.
+      const { stockQty, ...editable } = body;
+
+      await tx.product.update({
+        where: { id: existing.id },
+        data: {
+          ...editable,
+          ...(body.price !== undefined ? { price: money(body.price) } : {}),
+          ...(body.cost !== undefined ? { cost: money(body.cost) } : {}),
+        },
+      });
+
+      if (stockQty !== undefined && Number(stockQty) !== Number(existing.stockQty)) {
+        const branchId = await resolveBranchId(tx, orgId);
+        await setStockLevel(
+          tx,
+          { orgId, branchId, userId: req.auth!.userId },
+          { productId: existing.id, counted: Number(stockQty), note: 'Set from product edit' },
+        );
+      }
+
+      return tx.product.findUniqueOrThrow({ where: { id: existing.id } });
+    });
+
+    ok(res, product);
+  }),
+);
+
+productsRouter.delete(
+  '/:id',
+  requireRole('MANAGER'),
+  validate({ params: idParam }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const existing = await prisma.product.findFirst({ where: { id: req.params.id!, orgId, deletedAt: null } });
+    if (!existing) throw NotFound('Product');
+    // Soft delete — sale history keeps its snapshot either way.
+    await prisma.product.update({ where: { id: existing.id }, data: { deletedAt: new Date(), isActive: false } });
+    ok(res, { deleted: true });
+  }),
+);
+
+// --- Shelfie: photo → draft catalog -----------------------------------------
+
+productsRouter.post(
+  '/shelfie',
+  requireRole('MANAGER'),
+  validate({
+    body: z.object({
+      // 'catalog' reads shelves/price lists → new products.
+      // 'invoice' reads supplier invoices → goods received (Shelfie v2).
+      mode: z.enum(['catalog', 'invoice']).default('catalog'),
+      images: z
+        .array(
+          z.object({
+            data: z.string().min(100).max(8_000_000), // ~6MB decoded
+            mediaType: z.enum(['image/jpeg', 'image/png', 'image/webp']),
+          }),
+        )
+        .min(1, 'Add at least one photo')
+        .max(4, 'Maximum 4 photos per scan'),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const { mode, images } = req.body as {
+      mode: 'catalog' | 'invoice';
+      images: Parameters<typeof extractProductsFromImages>[0];
+    };
+    const org = await prisma.organization.findUniqueOrThrow({
+      where: { id: orgId },
+      select: { currency: true, language: true },
+    });
+
+    if (mode === 'invoice') {
+      const result = await extractInvoiceItems(images, { currency: org.currency });
+      return ok(res, result);
+    }
+    const result = await extractProductsFromImages(images, { currency: org.currency, language: org.language });
+    ok(res, result);
+  }),
+);
+
+/** Feature flag for the client — hides the Shelfie button when unconfigured. */
+productsRouter.get('/shelfie/status', asyncHandler(async (_req, res) => ok(res, { enabled: shelfieEnabled() })));
+
+/**
+ * Bulk insert — the second half of Shelfie, also useful for CSV-style imports
+ * later. Categories are created on demand by name; the plan cap is enforced
+ * on the whole batch up front so the operator gets one clear message instead
+ * of a half-imported catalog.
+ */
+productsRouter.post(
+  '/bulk',
+  requireRole('MANAGER'),
+  validate({
+    body: z.object({
+      products: z
+        .array(
+          z.object({
+            name: z.string().trim().min(1).max(180),
+            price: z.coerce.number().nonnegative().max(99_999_999),
+            categoryName: z.string().trim().max(80).nullable().optional(),
+            barcode: z.string().trim().max(60).nullable().optional(),
+          }),
+        )
+        .min(1)
+        .max(300),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const { products } = req.body as {
+      products: Array<{ name: string; price: number; categoryName?: string | null; barcode?: string | null }>;
+    };
+
+    const org = await prisma.organization.findUniqueOrThrow({ where: { id: orgId }, include: { plan: true } });
+    if (org.plan.maxProducts >= 0) {
+      const count = await prisma.product.count({ where: { orgId, deletedAt: null } });
+      if (count + products.length > org.plan.maxProducts) {
+        throw PlanLimit(
+          `Adding ${products.length} products would exceed the ${org.plan.name} plan limit of ${org.plan.maxProducts}. Upgrade to import them all.`,
+        );
+      }
+    }
+
+    // Resolve categories once per distinct name.
+    const wantedCategories = [...new Set(products.map((p) => p.categoryName).filter((n): n is string => Boolean(n)))];
+    const categoryIds = new Map<string, string>();
+    for (const name of wantedCategories) {
+      const existing = await prisma.category.findFirst({ where: { orgId, name, deletedAt: null } });
+      const category = existing ?? (await prisma.category.create({ data: { orgId, name } }));
+      categoryIds.set(name, category.id);
+    }
+
+    const created = await prisma.product.createMany({
+      data: products.map((p) => ({
+        orgId,
+        name: p.name,
+        price: money(p.price),
+        barcode: p.barcode ?? null,
+        categoryId: p.categoryName ? categoryIds.get(p.categoryName) ?? null : null,
+      })),
+    });
+
+    logger.info({ orgId, created: created.count }, 'bulk product import');
+    ok(res, { created: created.count }, 201);
+  }),
+);
+
+// --- Barcode auto-fill via Open Food Facts ----------------------------------
+
+productsRouter.get(
+  '/lookup/:barcode',
+  validate({ params: z.object({ barcode: z.string().regex(/^\d{6,14}$/, 'Barcode must be 6–14 digits') }) }),
+  asyncHandler(async (req, res) => {
+    const barcode = req.params.barcode!;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    try {
+      const upstream = await fetch(
+        `https://world.openfoodfacts.org/api/v2/product/${barcode}.json?fields=product_name,brands,quantity`,
+        { signal: controller.signal, headers: { 'User-Agent': 'SillaraPOS/1.0 (hello@sillara.com)' } },
+      );
+      const json = (await upstream.json()) as {
+        status: number;
+        product?: { product_name?: string; brands?: string; quantity?: string };
+      };
+      if (json.status !== 1 || !json.product?.product_name) return ok(res, { found: false });
+      const name = [json.product.brands?.split(',')[0], json.product.product_name, json.product.quantity]
+        .filter(Boolean)
+        .join(' ')
+        .slice(0, 180);
+      ok(res, { found: true, name });
+    } catch {
+      // Offline or upstream slow — autofill is a nicety, never an error.
+      ok(res, { found: false });
+    } finally {
+      clearTimeout(timer);
+    }
+  }),
+);
+
+// --- categories -------------------------------------------------------------
+
+productsRouter.post(
+  '/categories',
+  requireRole('MANAGER'),
+  validate({ body: z.object({ name: z.string().trim().min(1).max(80), color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).default('#6366F1') }) }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const category = await prisma.category.create({
+      data: { orgId, name: req.body.name as string, color: req.body.color as string },
+    });
+    ok(res, category, 201);
+  }),
+);

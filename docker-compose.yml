@@ -1,0 +1,36 @@
+# Local one-command stack. Production runs the API on a VPS with PM2 and the
+# frontends on Vercel — this exists so a new contributor can boot the whole
+# thing without installing MySQL.
+services:
+  db:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: sillara
+      MYSQL_DATABASE: sillara
+    ports: ['3307:3306']
+    volumes: ['sillara-db:/var/lib/mysql']
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', '127.0.0.1', '-psillara']
+      interval: 5s
+      retries: 20
+
+  api:
+    build: ./server
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: mysql://root:sillara@db:3306/sillara
+      NODE_ENV: production
+      PORT: '4100'
+      APP_URL: http://localhost:5273
+      SITE_URL: http://localhost:5274
+      API_URL: http://localhost:4100
+      CORS_ORIGINS: http://localhost:5273,http://localhost:5274
+      JWT_SECRET: dev_only_secret_replace_me_with_32_bytes_hex_value
+      MAGIC_LINK_SECRET: dev_only_secret_replace_me_with_other_32_bytes_hex
+      EMAIL_PROVIDER: console
+    ports: ['4100:4100']
+    command: sh -c "npx prisma migrate deploy && node dist/server.js"
+
+volumes:
+  sillara-db:

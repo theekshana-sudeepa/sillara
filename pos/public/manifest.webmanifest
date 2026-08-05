@@ -1,0 +1,54 @@
+{
+  "name": "Sillara POS",
+  "short_name": "Sillara",
+  "description": "Point of sale that works offline. Photograph your shelf to build your catalog. Sell anywhere.",
+  "id": "/sell",
+  "start_url": "/sell",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "orientation": "any",
+  "background_color": "#0B1120",
+  "theme_color": "#4F46E5",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Sell",
+      "short_name": "Sell",
+      "url": "/sell",
+      "description": "Open the till"
+    },
+    {
+      "name": "Receive goods",
+      "short_name": "Receive",
+      "url": "/stock",
+      "description": "Photograph a supplier invoice"
+    }
+  ],
+  "categories": ["business", "productivity", "finance"]
+}

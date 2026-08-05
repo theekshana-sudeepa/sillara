@@ -1,0 +1,11 @@
+{
+  // Typecheck everything — app code, tests, prisma scripts, tooling config.
+  // The build (tsconfig.json) deliberately compiles less; this checks more.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts", "prisma/**/*.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

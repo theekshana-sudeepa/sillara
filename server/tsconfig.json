@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  // Tests sit beside the code they test but must never ship in dist/ — they
+  // import vitest, a devDependency that does not exist in production.
+  // `npm run typecheck` uses tsconfig.test.json, which does include them.
+  "exclude": ["node_modules", "dist", "src/**/*.test.ts"]
+}

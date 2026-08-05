@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" class="h-full">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="theme-color" content="#4F46E5" />
+    <meta name="description" content="Point of sale that works offline. Photograph your shelf to build your catalog. Sell anywhere." />
+
+    <!-- Installed-app chrome. apple-mobile-web-app-* drives Safari's
+         Add to Dock on macOS and Add to Home Screen on iOS. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Sillara" />
+    <meta name="application-name" content="Sillara" />
+
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <!-- Safari ignores the manifest's icons for Add to Dock; it reads this. -->
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+
+    <title>Sillara POS</title>
+  </head>
+  <body class="h-full bg-background text-foreground antialiased overscroll-none">
+    <div id="root" class="h-full"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      /**
+       * Register everywhere a service worker is allowed — which includes
+       * localhost, deliberately. Skipping it in dev meant the one machine
+       * where offline behaviour is developed was the one machine that could
+       * not install the app or test the offline shell.
+       *
+       * Vite serves /sw.js from public/ in dev, so this works unbuilt.
+       */
+      if ('serviceWorker' in navigator) {
+        addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').catch((err) => {
+            console.warn('Service worker registration failed — the app still runs, offline shell will not.', err);
+          });
+        });
+      }
+    </script>
+  </body>
+</html>

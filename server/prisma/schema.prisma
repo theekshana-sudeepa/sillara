@@ -1,0 +1,990 @@
+// ---------------------------------------------------------------------------
+// Sillara — multi-tenant POS platform (MySQL 8)
+//
+// TENANCY RULE #1: every business table carries `orgId` and every query is
+// scoped by it. There is no such thing as an unscoped read. The tenant guard
+// in src/middleware/org.ts enforces this at the request layer; the
+// composite unique keys below enforce it at the data layer.
+//
+// OFFLINE RULE #1: sales are created on devices that may be offline for hours.
+// The client mints the UUID; the server enforces UNIQUE(orgId, clientUuid).
+// A sync retried 50 times lands exactly one sale. Same philosophy as the
+// AutoBilling dedupe keys — the database is the idempotency layer.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------- ENUMS -------------------------------------
+
+enum OrgStatus {
+  PENDING     // signup started, payment not confirmed
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+}
+
+enum PlanCode {
+  FREE
+  SHOP
+  PRO
+}
+
+enum UserRole {
+  OWNER
+  MANAGER
+  CASHIER
+}
+
+enum SaleStatus {
+  COMPLETED
+  VOID
+}
+
+/// A refund is a sale with the signs reversed, not a separate kind of object.
+///
+/// It carries its own receipt number (a credit note is a numbered document
+/// everywhere that audits one), its own negative stock movements, and its own
+/// negative payments. Everything that already sums signed rows — revenue, tax,
+/// margin, the drawer — nets refunds out without being taught how.
+enum SaleKind {
+  SALE
+  REFUND
+}
+
+/// Movements on a customer's tab.
+enum CreditTxnType {
+  CHARGE // goods left the shop on account
+  SETTLE // the customer paid some of it down
+  ADJUST // write-off, correction
+}
+
+enum TenderType {
+  CASH
+  CARD
+  QR
+  CREDIT   // on-account / customer tab
+  OTHER
+}
+
+enum BillingProvider {
+  PADDLE   // worldwide, merchant of record
+  PAYHERE  // Sri Lanka: local cards + LankaQR
+  MANUAL   // free tier / comped accounts
+}
+
+enum StockMoveType {
+  SALE          // sold at the till (negative qty)
+  VOID_RETURN   // sale voided, stock returned (positive)
+  REFUND_RETURN // goods handed back on a refund (positive)
+  RECEIVE      // goods received from a supplier (positive)
+  ADJUST       // manual correction, either sign
+  COUNT        // stocktake set-to value, recorded as the delta
+  TRANSFER_IN  // arrived from another branch (positive)
+  TRANSFER_OUT // sent to another branch (negative)
+}
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+enum LoyaltyTxnType {
+  EARN
+  REDEEM
+  ADJUST
+  EXPIRE
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  SENT
+  PARTIAL
+  RECEIVED
+  CANCELLED
+}
+
+enum SupplierAccountStatus {
+  PENDING   // claimed a listing, not yet verified
+  ACTIVE
+  SUSPENDED
+}
+
+enum ConnectionStatus {
+  REQUESTED // shop asked to connect
+  ACTIVE
+  BLOCKED
+}
+
+// ---------------------------- PLATFORM LEVEL --------------------------------
+
+model Plan {
+  code        PlanCode @id
+  name        String   @db.VarChar(60)
+  priceUsd    Decimal  @db.Decimal(8, 2)
+  priceLkr    Decimal  @db.Decimal(10, 2)
+  maxTerminals Int
+  maxProducts  Int     // -1 = unlimited
+  maxUsers     Int
+  features    Json     // ["inventory","loyalty","multi_branch",...]
+  paddlePriceId  String? @db.VarChar(120)
+  payherePlanId  String? @db.VarChar(120)
+  sortOrder   Int      @default(0)
+
+  organizations Organization[]
+}
+
+model Organization {
+  id        String    @id @default(cuid())
+  slug      String    @unique @db.VarChar(60) // sillara.com/app/<slug>
+  name      String    @db.VarChar(180)
+  country   String    @default("LK") @db.VarChar(2)   // ISO 3166-1
+  currency  String    @default("LKR") @db.VarChar(3)  // ISO 4217
+  timezone  String    @default("Asia/Colombo") @db.VarChar(64)
+  language  String    @default("en") @db.VarChar(5)   // en | si | ta
+  status    OrgStatus @default(PENDING)
+
+  planCode        PlanCode        @default(FREE)
+  billingProvider BillingProvider @default(MANUAL)
+  billingRef      String?         @db.VarChar(191) // Paddle sub id / PayHere ref
+  trialEndsAt     DateTime?
+  provisionedAt   DateTime?
+  suspendedAt     DateTime?
+
+  // --- Billing lifecycle (P5) ---------------------------------------------
+  /// When the paid period runs out. Webhooks push this forward on every
+  /// successful charge; the lifecycle job is the safety net for when a
+  /// webhook never arrives (provider outage, dropped delivery, manual plan).
+  currentPeriodEnd   DateTime?
+  /// A shop that fails to pay keeps selling until this moment. Losing the
+  /// till mid-trade is not a dunning strategy — it is how you lose the shop.
+  graceUntil         DateTime?
+  /// Throttle: at most one billing-state email per org per day.
+  lastBillingEmailAt DateTime?
+  /// The end-of-day email: yesterday's takings and what is running low.
+  /// On by default — it is the thing owners open every morning.
+  dailyDigestEnabled Boolean @default(true)
+
+  // Receipt & tax identity (printed on every receipt)
+  receiptHeader String? @db.VarChar(255)
+  receiptFooter String? @db.VarChar(255)
+  address       String? @db.VarChar(255)
+  phone         String? @db.VarChar(40)
+  taxId         String? @db.VarChar(60)
+  taxRate       Decimal @default(0.00) @db.Decimal(5, 2) // default line tax %
+  taxInclusive  Boolean @default(true)  // prices include tax (common in retail)
+
+  // --- Loyalty (P3) — off until the owner switches it on ------------------
+  loyaltyEnabled     Boolean @default(false)
+  /// Points earned per 1 unit of currency spent. 1.0 = 1 point per rupee/dollar.
+  loyaltyEarnRate    Decimal @default(1.0000) @db.Decimal(8, 4)
+  /// Currency value of 1 point when redeemed. 0.01 = 100 points is 1 unit.
+  loyaltyRedeemValue Decimal @default(0.0100) @db.Decimal(8, 4)
+  /// Points a customer must hold before they can spend any.
+  loyaltyMinRedeem   Int     @default(100)
+
+  // --- Referral (P3) — shop refers shop, both get credit ------------------
+  referralCode    String? @unique @db.VarChar(16)
+  referredByOrgId String? @db.VarChar(32)
+  /// Free months earned from referrals, consumed by the billing engine.
+  creditMonths    Int     @default(0)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  plan      Plan         @relation(fields: [planCode], references: [code])
+  users     OrgUser[]
+  products  Product[]
+  categories Category[]
+  customers Customer[]
+  registers Register[]
+  sales     Sale[]
+  sequences OrgSequence[]
+  branches  Branch[]
+  shifts    Shift[]
+  suppliers Supplier[]
+  purchaseOrders PurchaseOrder[]
+  loyaltyTxns LoyaltyTransaction[]
+  creditTxns  CustomerCreditTransaction[]
+  referrals Referral[] @relation("ReferrerOrg")
+  emails    EmailMessage[]
+
+  @@index([status])
+  @@index([planCode])
+  // The lifecycle job sweeps by "whose period ended?" — this is the index it
+  // rides, so the sweep stays O(due orgs) and not O(all shops on earth).
+  @@index([status, currentPeriodEnd])
+  @@map("organizations")
+}
+
+// ------------------------------ BRANCHES -----------------------------------
+
+/// A physical location. Every org gets one at provisioning ("Main"), so
+/// single-shop tenants never see the concept — multi-branch is purely additive.
+model Branch {
+  id        String  @id @default(cuid())
+  orgId     String
+  name      String  @db.VarChar(120)
+  code      String  @db.VarChar(16) // BR-01
+  address   String? @db.VarChar(255)
+  phone     String? @db.VarChar(40)
+  isDefault Boolean @default(false)
+  isActive  Boolean @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  org            Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  registers      Register[]
+  sales          Sale[]
+  stock          BranchStock[]
+  movements      StockMovement[]
+  shifts         Shift[]
+  purchaseOrders PurchaseOrder[]
+  staff          OrgUser[]
+
+  @@unique([orgId, code])
+  @@index([orgId, isActive])
+  @@map("branches")
+}
+
+/// Per-branch stock balance. `Product.stockQty` stays the org-wide rollup
+/// (what a single-branch shop sees on the sell screen); this table is the
+/// per-location truth. Both are written in the same transaction as the
+/// StockMovement row, so the ledger reconciles either one.
+model BranchStock {
+  id         String   @id @default(cuid())
+  orgId      String
+  branchId   String
+  productId  String
+  qty        Decimal  @default(0.000) @db.Decimal(12, 3)
+  lowStockAt Decimal? @db.Decimal(12, 3)
+
+  updatedAt DateTime @updatedAt
+
+  branch  Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, productId])
+  @@index([orgId, productId])
+  @@map("branch_stock")
+}
+
+model OrgUser {
+  id           String   @id @default(cuid())
+  orgId        String
+  email        String   @db.VarChar(191)   // login id — unique per org
+  name         String   @db.VarChar(120)
+  role         UserRole @default(CASHIER)
+  passwordHash String?  @db.VarChar(255)   // null until magic link consumed
+  pin          String?  @db.VarChar(255)   // hashed 4-digit PIN for cashier switch
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+
+  /// PIN switching is a 4-digit secret that mints a full session for another
+  /// user — including the owner. Without a counter, a cashier who already
+  /// holds a valid token can walk all 10,000 combinations inside the ordinary
+  /// rate limit and come back as OWNER. Reset on every success.
+  pinFailedAttempts Int       @default(0)
+  pinLockedUntil    DateTime?
+
+  // One-shot activation link minted by the provisioner
+  magicToken     String?   @unique @db.VarChar(64) // sha256 of the raw token
+  magicExpiresAt DateTime?
+
+  /// Home branch. Null = works at every branch (owners, roaming managers).
+  branchId String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  branch Branch?      @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  sales  Sale[]
+
+  @@unique([orgId, email])
+  @@index([email])
+  @@map("org_users")
+}
+
+/// Idempotency ledger for payment providers. UNIQUE(provider, eventId) means
+/// a webhook replayed ten times provisions exactly one shop.
+model WebhookEvent {
+  id        String   @id @default(cuid())
+  provider  String   @db.VarChar(20)
+  eventId   String   @db.VarChar(191)
+  eventType String   @db.VarChar(80)
+  payload   Json
+  processedAt DateTime?
+  error     String?  @db.Text
+  createdAt DateTime @default(now())
+
+  @@unique([provider, eventId])
+  @@index([createdAt])
+  @@map("webhook_events")
+}
+
+// ------------------------------ TENANT LEVEL --------------------------------
+
+model Category {
+  id     String @id @default(cuid())
+  orgId  String
+  name   String @db.VarChar(80)
+  color  String @default("#6366F1") @db.VarChar(9) // sell-screen tile colour
+  sortOrder Int @default(0)
+
+  createdAt DateTime  @default(now())
+  deletedAt DateTime?
+
+  org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  products Product[]
+
+  @@unique([orgId, name])
+  @@map("categories")
+}
+
+model Product {
+  id         String  @id @default(cuid())
+  orgId      String
+  categoryId String?
+  sku        String? @db.VarChar(60)
+  barcode    String? @db.VarChar(60)
+  name       String  @db.VarChar(180)
+  price      Decimal @db.Decimal(12, 2)
+  cost       Decimal @default(0.00) @db.Decimal(12, 2)
+  taxRate    Decimal? @db.Decimal(5, 2) // null → org default
+  trackStock Boolean @default(false)
+  stockQty   Decimal @default(0.000) @db.Decimal(12, 3)
+  lowStockAt Decimal? @db.Decimal(12, 3)
+  unit       String  @default("pc") @db.VarChar(12) // pc | kg | l | m
+  isActive   Boolean @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  category Category?    @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  saleItems SaleItem[]
+  movements StockMovement[]
+  branchStock BranchStock[]
+  poItems   PurchaseOrderItem[]
+
+  @@unique([orgId, sku])
+  @@index([orgId, barcode])
+  @@index([orgId, isActive, deletedAt])
+  @@map("products")
+}
+
+model Customer {
+  id     String  @id @default(cuid())
+  orgId  String
+  name   String  @db.VarChar(120)
+  phone  String? @db.VarChar(40)   // WhatsApp receipt target
+  email  String? @db.VarChar(191)
+  loyaltyPoints Decimal @default(0.00) @db.Decimal(12, 2)
+  creditBalance Decimal @default(0.00) @db.Decimal(12, 2) // on-account tab
+  notes  String? @db.Text
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  org         Organization         @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  sales       Sale[]
+  loyaltyTxns LoyaltyTransaction[]
+  creditTxns  CustomerCreditTransaction[]
+
+  @@index([orgId, phone])
+  @@index([orgId, name])
+  @@map("customers")
+}
+
+model Register {
+  id       String  @id @default(cuid())
+  orgId    String
+  branchId String?
+  name     String  @db.VarChar(60) // "Counter 1"
+  deviceId String? @db.VarChar(120) // last device that claimed it
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  branch Branch?      @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  sales  Sale[]
+  shifts Shift[]
+
+  @@unique([orgId, name])
+  @@map("registers")
+}
+
+model Sale {
+  id         String     @id @default(cuid())
+  orgId      String
+  branchId   String?
+  shiftId    String?
+  registerId String?
+  cashierId  String?
+  customerId String?
+
+  /// Client-minted UUID. THE offline idempotency key.
+  clientUuid String     @db.VarChar(36)
+  /// Client-minted short id for the public receipt page (/r/:publicId).
+  /// Minted on-device so the WhatsApp share works even for offline sales.
+  publicId   String?    @unique @db.VarChar(24)
+  number     Int        // per-org human sequence: receipt #000123
+  status     SaleStatus @default(COMPLETED)
+  kind       SaleKind   @default(SALE)
+
+  /// Set on a REFUND: the sale being given back. Null on an ordinary sale.
+  originalSaleId String?
+
+  currency  String  @db.VarChar(3)
+  subtotal  Decimal @db.Decimal(12, 2)
+  discount  Decimal @default(0.00) @db.Decimal(12, 2)
+  tax       Decimal @default(0.00) @db.Decimal(12, 2)
+  total     Decimal @db.Decimal(12, 2)
+  tendered  Decimal @default(0.00) @db.Decimal(12, 2)
+  change    Decimal @default(0.00) @db.Decimal(12, 2)
+  /// The dominant tender, kept for receipts and for every report written
+  /// before split payment existed. `sale_payments` is the truth: a bill
+  /// settled half in cash and half by card has two rows there and the larger
+  /// of the two here.
+  tender    TenderType @default(CASH)
+
+  /// Loyalty on this sale — points granted, points spent, and the currency
+  /// discount those spent points bought.
+  pointsEarned    Decimal @default(0.00) @db.Decimal(12, 2)
+  pointsRedeemed  Decimal @default(0.00) @db.Decimal(12, 2)
+  loyaltyDiscount Decimal @default(0.00) @db.Decimal(12, 2)
+
+  note      String?  @db.VarChar(255)
+  soldAt    DateTime               // device clock — business truth
+  syncedAt  DateTime @default(now()) // server clock — sync audit
+  voidedAt  DateTime?
+  voidReason String? @db.VarChar(255)
+
+  org         Organization         @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  branch      Branch?              @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  shift       Shift?               @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  register    Register?            @relation(fields: [registerId], references: [id], onDelete: SetNull)
+  cashier     OrgUser?             @relation(fields: [cashierId], references: [id], onDelete: SetNull)
+  customer    Customer?            @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  items       SaleItem[]
+  payments    SalePayment[]
+  loyaltyTxns LoyaltyTransaction[]
+  creditTxns  CustomerCreditTransaction[]
+
+  original Sale?  @relation("SaleRefunds", fields: [originalSaleId], references: [id], onDelete: SetNull)
+  refunds  Sale[] @relation("SaleRefunds")
+
+  @@unique([orgId, clientUuid], name: "uniq_org_client_sale")
+  @@unique([orgId, number])
+  @@index([orgId, soldAt])
+  @@index([orgId, branchId, soldAt])
+  @@index([shiftId])
+  @@index([orgId, status, soldAt])
+  @@index([originalSaleId])
+  @@map("sales")
+}
+
+/// One row per tender applied to a sale. A bill settled half in cash and half
+/// by card is two rows; a bill settled entirely in cash is one.
+///
+/// Before this table a sale had a single `tender` enum, so split payment was
+/// not merely unimplemented — it was unrepresentable. The drawer count, the
+/// Z-report and every reconciliation downstream all read from here now, which
+/// is what makes "half cash, half card" arrive at the right expected cash.
+///
+/// INVARIANT: Σ(amount) == Sale.total, always. Enforced in domain/payments.ts.
+model SalePayment {
+  id     String     @id @default(cuid())
+  orgId  String
+  saleId String
+  type   TenderType
+
+  /// Signed. Positive on a sale, negative on a refund — so summing payments
+  /// across a day nets refunds out of the takings without a special case.
+  amount Decimal @db.Decimal(12, 2)
+
+  /// Cash only: what the customer physically handed over, and what went back.
+  /// `amount` is what stayed in the drawer.
+  tendered Decimal? @db.Decimal(12, 2)
+  change   Decimal? @db.Decimal(12, 2)
+
+  /// Card last-4, QR transaction id, cheque number — whatever reconciles this
+  /// line against an external statement.
+  reference String? @db.VarChar(80)
+
+  createdAt DateTime @default(now())
+
+  sale Sale @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  @@index([saleId])
+  @@index([orgId, type, createdAt])
+  @@map("sale_payments")
+}
+
+/// The customer tab, as a ledger.
+///
+/// `Customer.creditBalance` existed from the beginning and nothing ever wrote
+/// to it: a CREDIT sale booked revenue and recorded no receivable, so a
+/// wholesaler had no idea who owed what. Same shape as the stock and loyalty
+/// ledgers — this table is how the balance got where it is.
+model CustomerCreditTransaction {
+  id         String        @id @default(cuid())
+  orgId      String
+  customerId String
+  saleId     String?
+  type       CreditTxnType
+  /// Signed: CHARGE positive (they owe more), SETTLE negative.
+  amount     Decimal       @db.Decimal(12, 2)
+  /// How a settlement arrived — cash at the counter, bank transfer.
+  method     TenderType?
+  note       String?       @db.VarChar(255)
+
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  customer Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  sale     Sale?        @relation(fields: [saleId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, customerId, createdAt])
+  @@map("customer_credit_transactions")
+}
+
+model SaleItem {
+  id        String  @id @default(cuid())
+  productId String?
+  saleId    String
+  /// Snapshots — the receipt must read the same forever, even after the
+  /// product is renamed or repriced.
+  nameSnapshot  String  @db.VarChar(180)
+  unitPrice     Decimal @db.Decimal(12, 2)
+  qty           Decimal @db.Decimal(12, 3)
+  taxRate       Decimal @default(0.00) @db.Decimal(5, 2)
+  lineDiscount  Decimal @default(0.00) @db.Decimal(12, 2)
+  lineTotal     Decimal @db.Decimal(12, 2)
+
+  /// COGS per unit, frozen at the moment of sale.
+  ///
+  /// The margin snapshot that was missing. Without it the profit report had to
+  /// join `products.cost`, which every delivery overwrites — so last month's
+  /// margin silently changed when today's stock arrived. Null means the cost
+  /// was unknown at sale time (a free-text line, or stock that predates this
+  /// column); those lines are reported as uncosted rather than as pure profit.
+  unitCost      Decimal? @db.Decimal(12, 2)
+  /// Revenue for this line: after every discount, never including tax.
+  /// Reporting reads this and only this — it means the same thing whether the
+  /// shop prices tax-inclusive or adds it at the till.
+  netExTax      Decimal? @db.Decimal(12, 2)
+  /// Tax attributed to this line. Grouping these by `taxRate` is what a filed
+  /// return needs from a mixed basket.
+  taxAmount     Decimal  @default(0.00) @db.Decimal(12, 2)
+
+  /// On an original sale line: how much of it has been given back so far.
+  /// This is what stops a customer refunding three of the two they bought.
+  refundedQty    Decimal @default(0.000) @db.Decimal(12, 3)
+  /// On a REFUND line: the original line it reverses.
+  originalItemId String?
+
+  sale    Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([saleId])
+  @@index([productId])
+  @@map("sale_items")
+}
+
+/// Immutable stock ledger. `stockQty` on Product is the cached balance; this
+/// table is the truth of HOW it got there — every sale, receive, void and
+/// correction is one signed row. Enterprise POS reporting grows from here.
+model StockMovement {
+  id        String        @id @default(cuid())
+  orgId     String
+  branchId  String?
+  productId String
+  type      StockMoveType
+  qty       Decimal       @db.Decimal(12, 3) // signed: sales negative, receives positive
+  unitCost  Decimal?      @db.Decimal(12, 2) // cost on RECEIVE rows — feeds margin reports
+  note      String?       @db.VarChar(255)   // supplier name, adjustment reason…
+  refType   String?       @db.VarChar(20)    // "sale" | "receive_batch"
+  refId     String?       @db.VarChar(64)
+  createdById String?
+
+  createdAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  branch  Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, productId, createdAt])
+  @@index([orgId, branchId, createdAt])
+  @@index([orgId, type, createdAt])
+  @@map("stock_movements")
+}
+
+// ------------------------------- SHIFTS ------------------------------------
+
+/// A cash-drawer session. Open with a float, sell, close by counting the
+/// drawer — the difference between expected and counted is the variance, the
+/// single number that tells an owner whether the till is honest.
+model Shift {
+  id         String      @id @default(cuid())
+  orgId      String
+  branchId   String?
+  registerId String?
+  status     ShiftStatus @default(OPEN)
+
+  openingFloat Decimal  @db.Decimal(12, 2)
+  /// Snapshot taken at close: float + cash sales − cash refunds.
+  expectedCash Decimal? @db.Decimal(12, 2)
+  countedCash  Decimal? @db.Decimal(12, 2)
+  /// countedCash − expectedCash. Negative means the drawer is short.
+  variance     Decimal? @db.Decimal(12, 2)
+
+  openedById String?
+  closedById String?
+  openedAt   DateTime  @default(now())
+  closedAt   DateTime?
+  note       String?   @db.VarChar(255)
+
+  org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  branch   Branch?      @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  register Register?    @relation(fields: [registerId], references: [id], onDelete: SetNull)
+  sales    Sale[]
+
+  @@index([orgId, status])
+  @@index([orgId, openedAt])
+  @@map("shifts")
+}
+
+// ------------------------------- LOYALTY -----------------------------------
+
+/// Append-only points ledger. `Customer.loyaltyPoints` is the cached balance;
+/// this is how it got there. Same philosophy as the stock ledger.
+model LoyaltyTransaction {
+  id         String         @id @default(cuid())
+  orgId      String
+  customerId String
+  saleId     String?
+  type       LoyaltyTxnType
+  /// Signed: EARN positive, REDEEM negative.
+  points     Decimal        @db.Decimal(12, 2)
+  /// Currency value applied to the sale when redeeming.
+  value      Decimal?       @db.Decimal(12, 2)
+  note       String?        @db.VarChar(255)
+
+  createdAt DateTime @default(now())
+
+  org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  customer Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  sale     Sale?        @relation(fields: [saleId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, customerId, createdAt])
+  @@map("loyalty_transactions")
+}
+
+// -------------------------- SUPPLIERS & PURCHASING -------------------------
+
+model Supplier {
+  id      String  @id @default(cuid())
+  orgId   String
+  name    String  @db.VarChar(180)
+  phone   String? @db.VarChar(40)
+  email   String? @db.VarChar(191)
+  address String? @db.VarChar(255)
+  notes   String? @db.Text
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  org            Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  purchaseOrders PurchaseOrder[]
+
+  @@unique([orgId, name])
+  @@map("suppliers")
+}
+
+/// The other half of Shelfie v2: order first, then receive against the order.
+/// Receiving without a PO still works — a PO just gives you the expected-vs-
+/// delivered comparison that stops suppliers short-shipping you quietly.
+model PurchaseOrder {
+  id         String              @id @default(cuid())
+  orgId      String
+  branchId   String?
+  supplierId String?
+  /// Set when the order was placed THROUGH the network rather than typed by
+  /// hand. Network orders appear in the supplier's portal; manual ones don't.
+  supplierAccountId String?
+  number     Int
+  status     PurchaseOrderStatus @default(DRAFT)
+
+  currency   String   @db.VarChar(3)
+  total      Decimal  @default(0.00) @db.Decimal(12, 2)
+  expectedAt DateTime? @db.Date
+  notes      String?  @db.Text
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  sentAt      DateTime?
+  confirmedAt DateTime?
+  receivedAt  DateTime?
+
+  org             Organization        @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  branch          Branch?             @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  supplier        Supplier?           @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  supplierAccount SupplierAccount?    @relation(fields: [supplierAccountId], references: [id], onDelete: SetNull)
+  items           PurchaseOrderItem[]
+
+  @@unique([orgId, number])
+  @@index([orgId, status])
+  @@index([supplierAccountId, status])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderItem {
+  id                String  @id @default(cuid())
+  purchaseOrderId   String
+  productId         String?
+  /// The supplier catalog row this line came from, when ordered via network.
+  supplierProductId String?
+  /// Frozen name — the PO reads the same forever, even after a rename.
+  nameSnapshot    String  @db.VarChar(180)
+  qty             Decimal @db.Decimal(12, 3)
+  qtyReceived     Decimal @default(0.000) @db.Decimal(12, 3)
+  unitCost        Decimal @default(0.00) @db.Decimal(12, 2)
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  product       Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([purchaseOrderId])
+  @@map("purchase_order_items")
+}
+
+// ------------------------- THE SUPPLIER NETWORK (P4) ------------------------
+//
+// This is the moat. `Supplier` (above) is a shop's PRIVATE address-book entry.
+// `SupplierAccount` is a supplier as a PLATFORM PARTICIPANT — one record shared
+// by every shop that buys from them. That distinction is the whole design:
+// a competitor can copy the sell screen, but not 5,000 connected shops and the
+// suppliers who serve them.
+//
+// Suppliers authenticate by signed magic link rather than passwords. They are
+// low-frequency users (check orders, update prices) and forcing a second full
+// auth product on them would kill adoption before the network could form.
+
+model SupplierAccount {
+  id       String                @id @default(cuid())
+  slug     String                @unique @db.VarChar(80)
+  name     String                @db.VarChar(180)
+  email    String                @unique @db.VarChar(191)
+  phone    String?               @db.VarChar(40)
+  country  String                @default("LK") @db.VarChar(2)
+  currency String                @default("LKR") @db.VarChar(3)
+  status   SupplierAccountStatus @default(PENDING)
+
+  description String? @db.Text
+  address     String? @db.VarChar(255)
+  minOrder    Decimal @default(0.00) @db.Decimal(12, 2)
+  leadDays    Int     @default(2)
+
+  /// Portal access: sha256 of the raw magic token. Suppliers never hold a
+  /// password — the link in their order-notification email IS the session.
+  portalToken     String?   @unique @db.VarChar(64)
+  portalExpiresAt DateTime?
+  lastSeenAt      DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  products    SupplierProduct[]
+  connections SupplierConnection[]
+  orders      PurchaseOrder[]
+
+  @@index([country, status])
+  @@map("supplier_accounts")
+}
+
+/// A supplier's published price list — what connected shops browse and order.
+model SupplierProduct {
+  id                String  @id @default(cuid())
+  supplierAccountId String
+  name              String  @db.VarChar(180)
+  sku               String? @db.VarChar(60)
+  barcode           String? @db.VarChar(60)
+  category          String? @db.VarChar(80)
+  unitCost          Decimal @db.Decimal(12, 2)
+  /// Minimum order quantity and units per case — the two numbers that make
+  /// wholesale ordering different from retail.
+  moq       Decimal @default(1.000) @db.Decimal(12, 3)
+  packSize  Decimal @default(1.000) @db.Decimal(12, 3)
+  unit      String  @default("pc") @db.VarChar(12)
+  inStock   Boolean @default(true)
+  isActive  Boolean @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  supplier SupplierAccount @relation(fields: [supplierAccountId], references: [id], onDelete: Cascade)
+
+  @@index([supplierAccountId, isActive])
+  @@index([barcode])
+  @@map("supplier_products")
+}
+
+/// Shop ↔ supplier relationship. The edge that makes this a network rather
+/// than a directory.
+model SupplierConnection {
+  id                String           @id @default(cuid())
+  orgId             String
+  supplierAccountId String
+  status            ConnectionStatus @default(REQUESTED)
+  /// Shop's account reference with this supplier, if they have one.
+  accountRef     String? @db.VarChar(80)
+  creditTermDays Int     @default(0)
+  note           String? @db.VarChar(255)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  supplier SupplierAccount @relation(fields: [supplierAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, supplierAccountId])
+  @@index([supplierAccountId, status])
+  @@map("supplier_connections")
+}
+
+// ------------------------------ REFERRALS ----------------------------------
+
+/// One row per successful referral. The referrer earns credit when the
+/// referred shop provisions; unique(referredOrgId) means a shop can only ever
+/// be counted once, however many links it clicked.
+model Referral {
+  id            String   @id @default(cuid())
+  referrerOrgId String
+  referredOrgId String   @unique
+  code          String   @db.VarChar(16)
+  creditMonths  Int      @default(1)
+  createdAt     DateTime @default(now())
+
+  referrer Organization @relation("ReferrerOrg", fields: [referrerOrgId], references: [id], onDelete: Cascade)
+
+  @@index([referrerOrgId])
+  @@map("referrals")
+}
+
+/// Per-org counters (receipt numbers). Same LAST_INSERT_ID technique as
+/// AutoBilling — gap-free and race-safe under concurrent syncs.
+model OrgSequence {
+  id      Int    @id @default(autoincrement())
+  orgId   String
+  scope   String @db.VarChar(20) // "sale"
+  current Int    @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, scope])
+  @@map("org_sequences")
+}
+
+model AuditLog {
+  id       String  @id @default(cuid())
+  orgId    String? // null = platform-level event
+  actorId  String?
+  action   String  @db.VarChar(80)
+  entity   String  @db.VarChar(60)
+  entityId String? @db.VarChar(64)
+  detail   Json?
+  ip       String? @db.VarChar(64)
+
+  createdAt DateTime @default(now())
+
+  @@index([orgId, createdAt])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+// ------------------------- SCHEDULED WORK (P5) ------------------------------
+
+enum JobStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+/// One row per (job, run window). The UNIQUE constraint *is* the lock: when
+/// two API instances both fire the 02:00 cron, they race to INSERT the same
+/// (jobName, runKey) and exactly one wins. No Redis, no leader election — the
+/// database you already trust with money is also the thing that says "mine".
+model JobRun {
+  id         String    @id @default(cuid())
+  jobName    String    @db.VarChar(60)
+  /// The window this run belongs to, e.g. "2026-08-01" or "2026-08-01T14".
+  runKey     String    @db.VarChar(60)
+  status     JobStatus @default(RUNNING)
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  detail     Json?
+  error      String?   @db.Text
+
+  @@unique([jobName, runKey], name: "uniq_job_run")
+  @@index([jobName, startedAt])
+  @@map("job_runs")
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+/// Transactional email outbox.
+///
+/// Nothing sends mail inline. A request or a job writes a row and returns;
+/// the flush job does the network I/O. That buys three things a direct
+/// `await resend.send()` cannot: a provider outage never fails a customer's
+/// signup, retries are automatic, and `dedupeKey` makes a re-run of any job
+/// physically incapable of mailing the same shop twice.
+model EmailMessage {
+  id        String      @id @default(cuid())
+  orgId     String?
+  /// e.g. "trial-ending:<orgId>:2026-08-01". Unique — the second insert loses.
+  dedupeKey String      @unique @db.VarChar(191)
+  template  String      @db.VarChar(60)
+  to        String      @db.VarChar(191)
+  subject   String      @db.VarChar(255)
+  html      String      @db.MediumText
+  text      String      @db.Text
+  status    EmailStatus @default(PENDING)
+  attempts  Int         @default(0)
+  lastError String?     @db.Text
+  /// Exponential backoff lives here, not in a queue server.
+  sendAfter DateTime    @default(now())
+  sentAt    DateTime?
+  createdAt DateTime    @default(now())
+
+  org Organization? @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([status, sendAfter])
+  @@index([orgId, createdAt])
+  @@map("email_messages")
+}

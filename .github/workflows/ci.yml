@@ -1,0 +1,62 @@
+# The 22 bugs that sat in this repo were all compile-time. This workflow is the
+# cheapest possible insurance against that recurring: it fails on a type error,
+# a missing export, or an invalid schema in about 90 seconds — before a human
+# reads the diff.
+#
+# It also runs the integration suite against a real MySQL 8, because the
+# invariants that matter most (idempotent sale sync, gap-free receipt numbers,
+# tenant isolation) are enforced by the database, and a mock would happily
+# agree with a bug.
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: sillara_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -ptest"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      DATABASE_URL: mysql://root:test@127.0.0.1:3306/sillara_test
+      TEST_DATABASE_URL: mysql://root:test@127.0.0.1:3306/sillara_test
+      JWT_SECRET: ci_only_secret_that_is_at_least_32_characters_long
+      MAGIC_LINK_SECRET: ci_only_other_secret_at_least_32_characters_long
+      RUN_JOBS: 'false' # the tests drive the jobs directly; no cron in CI
+    defaults:
+      run: { working-directory: server }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: npx prisma validate
+      - run: npx prisma generate
+      - run: npx prisma migrate deploy
+      # Plans must exist before signup can provision an org — the integration
+      # tests sign up through the real public route, exactly like a customer.
+      - run: npm run seed
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
+  pos:
+    runs-on: ubuntu-latest
+    defaults:
+      run: { working-directory: pos }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
