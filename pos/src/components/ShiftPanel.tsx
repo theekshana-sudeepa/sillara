@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '@/lib/api';
 import { useSession } from '@/state/store';
+import { pendingSales } from '@/lib/db';
 import { money, timeOf } from '@/lib/format';
 
 /**
@@ -43,6 +44,7 @@ export function ShiftPanel({ onClose, onChanged }: { onClose: () => void; onChan
   const [countInput, setCountInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pendingBlock, setPendingBlock] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
@@ -71,15 +73,30 @@ export function ShiftPanel({ onClose, onChanged }: { onClose: () => void; onChan
     }
   };
 
-  const close = async () => {
+  const close = async (force = false) => {
     if (!shift) return;
     setBusy(true);
     setError(null);
     try {
-      await api.post(`/shifts/${shift.id}/close`, { countedCash: Number(countInput) || 0 });
+      // The server computes expected cash from sales it has received. Anything
+      // still in this device's outbox is money in the drawer that it cannot
+      // see, so it has to be told — otherwise the cashier is shown a shortage
+      // they did not cause.
+      const stillQueued = (await pendingSales()).length;
+
+      await api.post(`/shifts/${shift.id}/close`, {
+        countedCash: Number(countInput) || 0,
+        pendingCount: stillQueued,
+        force,
+      });
       onChanged(null);
       onClose();
     } catch (err) {
+      if (err instanceof ApiError && err.code === 'CONFLICT' && !force) {
+        setPendingBlock(err.message);
+        setBusy(false);
+        return;
+      }
       setError(err instanceof ApiError ? err.message : 'Could not close the shift');
       setBusy(false);
     }
@@ -157,13 +174,34 @@ export function ShiftPanel({ onClose, onChanged }: { onClose: () => void; onChan
               </>
             ) : null}
 
-            <div className="mt-5 grid grid-cols-2 gap-2">
-              <button onClick={onClose} className="h-12 rounded-xl bg-secondary text-sm font-semibold">Keep selling</button>
-              <button onClick={() => void close()} disabled={busy || !countInput}
-                className="h-12 rounded-xl bg-primary text-sm font-bold text-primary-foreground disabled:opacity-50">
-                {busy ? 'Closing…' : 'Close shift'}
-              </button>
-            </div>
+            {pendingBlock ? (
+              <div className="mt-4 rounded-xl border border-warning/30 bg-warning/10 p-3.5">
+                <p className="text-[13px] font-medium text-foreground">{pendingBlock}</p>
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => setPendingBlock(null)}
+                    className="h-11 rounded-lg bg-secondary text-[13px] font-semibold"
+                  >
+                    Wait and retry
+                  </button>
+                  <button
+                    onClick={() => void close(true)}
+                    disabled={busy}
+                    className="h-11 rounded-lg bg-destructive text-[13px] font-bold text-destructive-foreground disabled:opacity-50"
+                  >
+                    Close anyway
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="mt-5 grid grid-cols-2 gap-2">
+                <button onClick={onClose} className="h-12 rounded-xl bg-secondary text-sm font-semibold">Keep selling</button>
+                <button onClick={() => void close()} disabled={busy || !countInput}
+                  className="h-12 rounded-xl bg-primary text-sm font-bold text-primary-foreground disabled:opacity-50">
+                  {busy ? 'Closing…' : 'Close shift'}
+                </button>
+              </div>
+            )}
           </>
         )}
       </div>

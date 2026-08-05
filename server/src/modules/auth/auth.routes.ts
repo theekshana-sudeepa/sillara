@@ -51,21 +51,82 @@ authRouter.post(
   }),
 );
 
+/**
+ * Sign in.
+ *
+ * `OrgUser` is unique on (orgId, email), so one person can hold accounts at
+ * several shops under one address — which is the normal case for the owner of
+ * two branches trading as separate businesses, and for the bookkeeper who
+ * works for four of them.
+ *
+ * This used to take `findFirst(... orderBy createdAt asc)`: the oldest account
+ * won and every other shop that email belonged to was simply unreachable. No
+ * error, no chooser — the second shop just could not be logged into.
+ *
+ * So: verify the password against every account that address holds, and if
+ * more than one answers, hand back the list and let them pick. The list is
+ * only ever returned *after* a password matched, so it tells an attacker
+ * nothing they did not already know.
+ */
+const MAX_ACCOUNTS_PER_EMAIL = 10;
+
 authRouter.post(
   '/login',
   publicLimiter,
-  validate({ body: z.object({ email: z.string().trim().toLowerCase().email(), password: z.string().min(1) }) }),
+  validate({
+    body: z.object({
+      email: z.string().trim().toLowerCase().email(),
+      password: z.string().min(1),
+      /// Supplied on the second call when the first returned a chooser.
+      orgId: z.string().cuid().optional(),
+    }),
+  }),
   asyncHandler(async (req, res) => {
-    const user = await prisma.orgUser.findFirst({
-      where: { email: req.body.email as string, deletedAt: null, isActive: true },
+    const { email, password, orgId } = req.body as { email: string; password: string; orgId?: string };
+
+    const candidates = await prisma.orgUser.findMany({
+      where: {
+        email,
+        deletedAt: null,
+        isActive: true,
+        ...(orgId ? { orgId } : {}),
+        org: { deletedAt: null },
+      },
       include: { org: true },
       orderBy: { createdAt: 'asc' },
+      take: MAX_ACCOUNTS_PER_EMAIL,
     });
 
     // Always do the work, even when there is no such user — see DUMMY_PASSWORD_HASH.
-    const hash = user?.passwordHash ?? DUMMY_PASSWORD_HASH;
-    const valid = await verifyPassword(req.body.password as string, hash);
-    if (!user?.passwordHash || !valid) throw Unauthorized('Incorrect email or password');
+    if (candidates.length === 0) {
+      await verifyPassword(password, DUMMY_PASSWORD_HASH);
+      throw Unauthorized('Incorrect email or password');
+    }
+
+    const matched: typeof candidates = [];
+    for (const candidate of candidates) {
+      if (candidate.passwordHash && (await verifyPassword(password, candidate.passwordHash))) {
+        matched.push(candidate);
+      }
+    }
+    if (matched.length === 0) throw Unauthorized('Incorrect email or password');
+
+    // Several shops, same credentials: ask which one rather than guessing.
+    if (matched.length > 1) {
+      ok(res, {
+        mode: 'choose',
+        shops: matched.map((m) => ({
+          orgId: m.org.id,
+          name: m.org.name,
+          slug: m.org.slug,
+          role: m.role,
+          suspended: m.org.status === 'SUSPENDED' || m.org.status === 'CANCELLED',
+        })),
+      });
+      return;
+    }
+
+    const user = matched[0]!;
     if (user.org.status === 'SUSPENDED' || user.org.status === 'CANCELLED') {
       throw Unauthorized('This shop is suspended. Contact support@sillara.com');
     }
@@ -73,6 +134,7 @@ authRouter.post(
     await prisma.orgUser.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
 
     ok(res, {
+      mode: 'ready',
       token: signToken({ userId: user.id, orgId: user.orgId, role: user.role, email: user.email }),
       org: { id: user.org.id, slug: user.org.slug, name: user.org.name, currency: user.org.currency, language: user.org.language },
       user: { id: user.id, name: user.name, email: user.email, role: user.role },

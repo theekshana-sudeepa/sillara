@@ -114,14 +114,35 @@ shiftsRouter.post(
     body: z.object({
       countedCash: z.coerce.number().nonnegative().max(99_999_999),
       note: z.string().trim().max(255).optional(),
+      /// Sales still sitting in this device's outbox. The server cannot know
+      /// about them — that is the whole point of an offline till — so the
+      /// device reports them and we refuse to pretend the drawer balances.
+      pendingCount: z.coerce.number().int().nonnegative().max(10_000).default(0),
+      /// Close anyway, having been told. Recorded on the shift.
+      force: z.boolean().default(false),
     }),
   }),
   asyncHandler(async (req, res) => {
     const { orgId, userId } = req.auth!;
-    const { countedCash, note } = req.body as { countedCash: number; note?: string };
+    const { countedCash, note, pendingCount, force } = req.body as {
+      countedCash: number;
+      note?: string;
+      pendingCount: number;
+      force: boolean;
+    };
 
     const summary = await buildSummary(orgId, req.params.id!);
     if (summary.shift.status === 'CLOSED') throw Conflict('This shift is already closed');
+
+    // Expected cash is computed from sales the server has. A device holding
+    // unsynced sales has taken money nobody here knows about, so the variance
+    // would be reported as a shortage and the cashier blamed for it.
+    if (pendingCount > 0 && !force) {
+      throw Conflict(
+        `${pendingCount} sale(s) on this device haven't synced yet. Reconnect and let them through, ` +
+          `or close anyway — the variance will be wrong by whatever they came to.`,
+      );
+    }
 
     const expected = summary.expectedCash;
     const variance = Math.round((countedCash - expected) * 100) / 100;
@@ -137,7 +158,10 @@ shiftsRouter.post(
         variance: money(variance),
         closedById: userId,
         closedAt: new Date(),
-        note: note ?? summary.shift.note,
+        note:
+          pendingCount > 0
+            ? `${note ?? summary.shift.note ?? ''} [closed with ${pendingCount} unsynced sale(s) — variance unreliable]`.trim()
+            : note ?? summary.shift.note,
       },
     });
 

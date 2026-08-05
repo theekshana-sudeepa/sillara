@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type { Request, Response } from 'express';
-import type { Organization, Plan } from '@prisma/client';
+import type { Organization, Plan, PlanCode } from '@prisma/client';
 import { prisma, isUniqueViolation } from '../../lib/prisma.js';
 import { logger } from '../../lib/logger.js';
 import { env } from '../../config/env.js';
@@ -46,23 +46,65 @@ async function markProcessed(provider: string, eventId: string, error?: string):
  * `graceUntil` and lifting SUSPENDED is what makes reactivation instant: the
  * shop is selling again before the owner has closed the payment tab.
  */
-async function renewPeriod(orgId: string, provider: 'PADDLE' | 'PAYHERE', ref: string | null): Promise<void> {
+/**
+ * What did they actually pay for?
+ *
+ * The webhook used to take the plan on the org record on faith and extend it a
+ * month, whatever the money said. That trusts a field the customer's own
+ * checkout set, and it means a mismatch between the price they were charged
+ * and the plan they hold is invisible forever.
+ *
+ * The price id in a signed event is the authoritative answer, so it wins.
+ * An unrecognised price is recorded loudly rather than guessed at — it means
+ * someone added a price in Paddle and did not put it in the `plans` table.
+ */
+async function planForPrice(priceId: string | undefined): Promise<PlanCode | null> {
+  if (!priceId) return null;
+  const plan = await prisma.plan.findFirst({ where: { paddlePriceId: priceId }, select: { code: true } });
+  if (!plan) {
+    logger.error({ priceId }, '🚨 paid price id matches no plan — check plans.paddlePriceId');
+    return null;
+  }
+  return plan.code;
+}
+
+async function renewPeriod(
+  orgId: string,
+  provider: 'PADDLE' | 'PAYHERE',
+  ref: string | null,
+  opts: { planCode?: PlanCode | null; months?: number } = {},
+): Promise<void> {
   const org = await prisma.organization.findUnique({
     where: { id: orgId },
     select: { currentPeriodEnd: true, planCode: true },
   });
-  if (!org || org.planCode === 'FREE') return;
+  if (!org) return;
+
+  // The plan the money bought, falling back to the one on record.
+  const planCode = opts.planCode ?? org.planCode;
+  if (planCode === 'FREE') return;
+
+  if (opts.planCode && opts.planCode !== org.planCode) {
+    logger.warn(
+      { orgId, was: org.planCode, paidFor: opts.planCode },
+      'plan corrected from the price that was actually charged',
+    );
+  }
 
   const now = new Date();
   const base = org.currentPeriodEnd && org.currentPeriodEnd > now ? org.currentPeriodEnd : now;
+  // Annual subscriptions were impossible: every charge bought exactly a month
+  // regardless of what the customer signed up for.
+  const until = addMonths(base, opts.months ?? 1);
 
   await prisma.organization.update({
     where: { id: orgId },
     data: {
       status: 'ACTIVE',
+      planCode,
       billingProvider: provider,
       ...(ref ? { billingRef: ref } : {}),
-      currentPeriodEnd: addMonths(base, 1),
+      currentPeriodEnd: until,
       graceUntil: null,
       suspendedAt: null,
       trialEndsAt: null,
@@ -70,7 +112,7 @@ async function renewPeriod(orgId: string, provider: 'PADDLE' | 'PAYHERE', ref: s
     },
   });
   invalidateOrgCache(orgId);
-  logger.info({ orgId, provider, until: addMonths(base, 1) }, '💰 billing period renewed');
+  logger.info({ orgId, provider, planCode, until }, '💰 billing period renewed');
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +152,13 @@ export async function handlePaddleWebhook(req: Request, res: Response): Promise<
   const event = JSON.parse(rawBody.toString('utf8')) as {
     event_id: string;
     event_type: string;
-    data: { id?: string; status?: string; custom_data?: { orgId?: string } };
+    data: {
+      id?: string;
+      status?: string;
+      custom_data?: { orgId?: string };
+      items?: Array<{ price?: { id?: string } }>;
+      billing_cycle?: { interval?: string; frequency?: number };
+    };
   };
 
   // Always 200 fast — Paddle retries on non-2xx and we already own the event.
@@ -127,9 +175,17 @@ export async function handlePaddleWebhook(req: Request, res: Response): Promise<
       case 'transaction.completed': {
         if (!orgId) break;
         await provisionOrg(orgId, { provider: 'PADDLE', ref: event.data.id ?? null });
-        // A payment landed: own the next month, clear any grace, come back
+
+        // The signed event says which price was charged and over what cycle.
+        // Both beat whatever the org record currently claims.
+        const planCode = await planForPrice(event.data.items?.[0]?.price?.id);
+        const cycle = event.data.billing_cycle;
+        const months =
+          cycle?.interval === 'year' ? 12 * (cycle.frequency ?? 1) : cycle?.frequency ?? 1;
+
+        // A payment landed: own the next period, clear any grace, come back
         // from PAST_DUE or SUSPENDED without an operator touching anything.
-        await renewPeriod(orgId, 'PADDLE', event.data.id ?? null);
+        await renewPeriod(orgId, 'PADDLE', event.data.id ?? null, { planCode, months });
         break;
       }
       case 'subscription.past_due':
@@ -218,7 +274,14 @@ export async function handlePayhereNotify(req: Request, res: Response): Promise<
     `${merchant_id}${order_id}${payhere_amount}${payhere_currency}${status_code}${md5Upper(env.PAYHERE_MERCHANT_SECRET ?? '')}`,
   );
 
-  if (!md5sig || local !== md5sig || merchant_id !== env.PAYHERE_MERCHANT_ID) {
+  // Constant-time, like the Paddle path above. `!==` on a signature leaks how
+  // many leading bytes were right, one request at a time.
+  const signatureOk =
+    typeof md5sig === 'string' &&
+    md5sig.length === local.length &&
+    crypto.timingSafeEqual(Buffer.from(md5sig), Buffer.from(local));
+
+  if (!signatureOk || merchant_id !== env.PAYHERE_MERCHANT_ID) {
     logger.warn({ order_id }, 'payhere notify rejected — bad signature');
     res.status(401).send('bad signature');
     return;
