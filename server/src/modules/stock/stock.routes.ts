@@ -8,6 +8,7 @@ import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { money, toNumber, D } from '../../lib/money.js';
 import { NotFound, PlanLimit, BadRequest } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
+import { requireCapability } from "../../middleware/org.js";
 import { postStock, setStockLevel, resolveBranchId, weightedAverageCost } from '../../domain/stock.js';
 
 /**
@@ -33,6 +34,10 @@ const receiveRowSchema = z
     categoryName: z.string().trim().max(80).nullable().optional(),
     qty: z.coerce.number().positive().max(999_999),
     unitCost: z.coerce.number().nonnegative().max(99_999_999).nullable().optional(),
+    /// A delivery with a lot number or an expiry date becomes its own batch,
+    /// which is what FEFO then sells down and the expiry report reads.
+    batchNo: z.string().trim().max(60).nullable().optional(),
+    expiresAt: z.coerce.date().nullable().optional(),
   })
   .refine((r) => r.productId || (r.name && r.price !== undefined), {
     message: 'Each row needs a productId, or a name + selling price for a new product',
@@ -76,6 +81,100 @@ stockRouter.get(
         stockQty: Number(r.stockQty),
         lowStockAt: Number(r.lowStockAt),
         unit: r.unit,
+      })),
+    );
+  }),
+);
+
+/**
+ * What is about to go out of date.
+ *
+ * The report a pharmacy or a grocer actually opens: which lots, how much, and
+ * how long is left. Already-expired stock sorts first — it is on the shelf
+ * right now and should not be.
+ */
+stockRouter.get(
+  '/expiring',
+  requireCapability('stock.batches'),
+  validate({
+    query: z.object({
+      days: z.coerce.number().int().min(1).max(365).default(30),
+      branchId: z.string().cuid().optional(),
+      includeExpired: z.coerce.boolean().default(true),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const q = req.query as unknown as { days: number; branchId?: string; includeExpired: boolean };
+    const horizon = new Date(Date.now() + q.days * 86_400_000);
+    const today = new Date();
+
+    const batches = await prisma.stockBatch.findMany({
+      where: {
+        orgId,
+        qty: { gt: 0 },
+        expiresAt: {
+          not: null,
+          lte: horizon,
+          ...(q.includeExpired ? {} : { gte: today }),
+        },
+        ...(q.branchId ? { branchId: q.branchId } : {}),
+      },
+      orderBy: [{ expiresAt: 'asc' }],
+      take: 500,
+      include: {
+        product: { select: { id: true, name: true, unit: true } },
+        branch: { select: { id: true, name: true } },
+      },
+    });
+
+    const dayMs = 86_400_000;
+    ok(res, {
+      days: q.days,
+      batches: batches.map((b) => {
+        const daysLeft = b.expiresAt ? Math.floor((b.expiresAt.getTime() - today.getTime()) / dayMs) : null;
+        return {
+          id: b.id,
+          product: b.product,
+          branch: b.branch,
+          batchNo: b.batchNo,
+          expiresAt: b.expiresAt,
+          daysLeft,
+          expired: daysLeft !== null && daysLeft < 0,
+          qty: toNumber(b.qty),
+          unitCost: b.unitCost ? toNumber(b.unitCost) : null,
+          /// What walking it to the bin would cost — the number that gets an
+          /// owner to act on this screen rather than close it.
+          valueAtRisk: b.unitCost ? Math.round(toNumber(b.qty) * toNumber(b.unitCost) * 100) / 100 : null,
+        };
+      }),
+    });
+  }),
+);
+
+/** Every batch of one product, oldest expiry first — the FEFO queue itself. */
+stockRouter.get(
+  '/batches/:productId',
+  requireCapability('stock.batches'),
+  validate({ params: z.object({ productId: z.string().cuid() }) }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const batches = await prisma.stockBatch.findMany({
+      where: { orgId, productId: req.params.productId! },
+      orderBy: [{ expiresAt: 'asc' }, { receivedAt: 'asc' }],
+      take: 200,
+      include: { branch: { select: { id: true, name: true } } },
+    });
+    ok(
+      res,
+      batches.map((b) => ({
+        id: b.id,
+        batchNo: b.batchNo,
+        expiresAt: b.expiresAt,
+        qty: toNumber(b.qty),
+        unitCost: b.unitCost ? toNumber(b.unitCost) : null,
+        branch: b.branch,
+        receivedAt: b.receivedAt,
       })),
     );
   }),
@@ -202,6 +301,8 @@ stockRouter.post(
         categoryName?: string | null;
         qty: number;
         unitCost?: number | null;
+        batchNo?: string | null;
+        expiresAt?: Date | null;
       }>;
     };
 
@@ -221,6 +322,8 @@ stockRouter.post(
 
     const batchId = `rcv_${Date.now().toString(36)}`;
     const note = supplier ? `Received from ${supplier}` : 'Goods received';
+
+    const batchTracking = req.org?.capabilities.includes('stock.batches') ?? false;
 
     const result = await prisma.$transaction(async (tx) => {
       let created = 0;
@@ -278,6 +381,38 @@ stockRouter.post(
           created += 1;
         }
 
+        // A delivery with a lot number or an expiry IS a batch. Same lot
+        // arriving twice tops up the existing row rather than splitting the
+        // shelf in two.
+        let stockBatchId: string | null = null;
+        if (batchTracking && (row.batchNo || row.expiresAt)) {
+          const existing = await tx.stockBatch.findFirst({
+            where: {
+              orgId,
+              productId,
+              branchId: branch,
+              batchNo: row.batchNo ?? null,
+              expiresAt: row.expiresAt ?? null,
+            },
+            select: { id: true },
+          });
+          stockBatchId =
+            existing?.id ??
+            (
+              await tx.stockBatch.create({
+                data: {
+                  orgId,
+                  productId,
+                  branchId: branch,
+                  batchNo: row.batchNo ?? null,
+                  expiresAt: row.expiresAt ?? null,
+                  qty: D(0), // the RECEIVE posting below puts it on the shelf
+                  unitCost: row.unitCost != null ? money(row.unitCost) : null,
+                },
+              })
+            ).id;
+        }
+
         await postStock(tx, { orgId, branchId: branch, userId }, [
           {
             productId,
@@ -287,6 +422,7 @@ stockRouter.post(
             note,
             refType: 'receive_batch',
             refId: batchId,
+            batchId: stockBatchId,
           },
         ]);
       }

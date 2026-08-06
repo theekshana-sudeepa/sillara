@@ -1,6 +1,7 @@
 import { Prisma, type StockMoveType } from '@prisma/client';
 import { D, money } from '../lib/money.js';
 import { NotFound } from '../lib/errors.js';
+import { allocateFefo, type Allocation } from './batches.js';
 
 /**
  * ---------------------------------------------------------------------------
@@ -40,6 +41,14 @@ export interface StockContext {
   /** Null only for orgs provisioned before branches existed. */
   branchId: string | null;
   userId?: string | null;
+  /**
+   * Allocate outgoing stock across batches, soonest expiry first.
+   *
+   * Set from `stock.batches` on the calling route. When on, a single line
+   * leaving the shelf can become several ledger rows — one per batch it drew
+   * on — which is what makes the expiry report and per-delivery costs true.
+   */
+  batches?: boolean;
 }
 
 export interface StockPosting {
@@ -52,6 +61,11 @@ export interface StockPosting {
   note?: string | null;
   refType?: string | null;
   refId?: string | null;
+  /**
+   * Explicit batch, used when receiving — the delivery IS the batch. Outgoing
+   * movements leave this null and let FEFO choose.
+   */
+  batchId?: string | null;
 }
 
 /**
@@ -84,21 +98,74 @@ export async function postStock(
       });
     }
 
-    await tx.stockMovement.create({
-      data: {
-        orgId: ctx.orgId,
-        branchId: ctx.branchId,
-        productId: posting.productId,
-        type: posting.type,
-        qty,
-        unitCost: posting.unitCost != null ? money(posting.unitCost) : null,
-        note: posting.note ?? null,
-        refType: posting.refType ?? null,
-        refId: posting.refId ?? null,
-        createdById: ctx.userId ?? null,
-      },
-    });
+    // Stock leaving a batch-tracking shop is split across batches, soonest
+    // expiry first. One line off the shelf can be several ledger rows — that
+    // is what makes the expiry report and per-delivery cost true. Everything
+    // else (receives, returns, transfers) carries whatever batch it was told.
+    const splits = ctx.batches && qty.lt(0) ? await allocateOutgoing(tx, ctx, posting.productId, qty.abs()) : null;
+
+    for (const part of splits ?? [{ batchId: posting.batchId ?? null, qty }]) {
+      const moveQty = splits ? part.qty.negated() : part.qty;
+
+      await tx.stockMovement.create({
+        data: {
+          orgId: ctx.orgId,
+          branchId: ctx.branchId,
+          productId: posting.productId,
+          type: posting.type,
+          qty: moveQty,
+          unitCost: posting.unitCost != null ? money(posting.unitCost) : null,
+          note: posting.note ?? null,
+          refType: posting.refType ?? null,
+          refId: posting.refId ?? null,
+          createdById: ctx.userId ?? null,
+          batchId: part.batchId,
+        },
+      });
+
+      // The batch balance is a cache of the movements carrying its id, like
+      // every other balance here.
+      if (part.batchId) {
+        await tx.stockBatch.update({
+          where: { id: part.batchId },
+          data: { qty: { increment: moveQty } },
+        });
+      }
+    }
   }
+}
+
+/** Read the shelf and let FEFO decide. Locked, so two tills cannot double-spend a batch. */
+async function allocateOutgoing(
+  tx: Prisma.TransactionClient,
+  ctx: StockContext,
+  productId: string,
+  qty: Prisma.Decimal,
+): Promise<Allocation[]> {
+  // FOR UPDATE: two cashiers selling the last box of the March batch at the
+  // same moment would otherwise both be allocated it, and the batch would go
+  // to -1 while the expiry report still showed stock.
+  const rows = await tx.$queryRaw<Array<{ id: string; qty: string; expiresAt: Date | null; receivedAt: Date; unitCost: string | null }>>`
+    SELECT id, qty, expiresAt, receivedAt, unitCost
+    FROM stock_batches
+    WHERE orgId = ${ctx.orgId}
+      AND productId = ${productId}
+      AND qty > 0
+      AND (${ctx.branchId} IS NULL OR branchId = ${ctx.branchId} OR branchId IS NULL)
+    ORDER BY expiresAt IS NULL, expiresAt ASC, receivedAt ASC
+    FOR UPDATE
+  `;
+
+  return allocateFefo(
+    qty,
+    rows.map((r) => ({
+      id: r.id,
+      qty: r.qty,
+      expiresAt: r.expiresAt,
+      receivedAt: r.receivedAt,
+      unitCost: r.unitCost,
+    })),
+  );
 }
 
 /**

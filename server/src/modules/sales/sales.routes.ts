@@ -106,6 +106,7 @@ salesRouter.post(
   validate({ body: syncSchema }),
   asyncHandler(async (req, res) => {
     const { orgId, userId } = req.auth!;
+    const batchTracking = req.org?.capabilities.includes("stock.batches") ?? false;
     const org = await prisma.organization.findUnique({
       where: { id: orgId },
       select: {
@@ -282,7 +283,7 @@ salesRouter.post(
           if (movingLines.length > 0) {
             await postStock(
               tx,
-              { orgId, branchId, userId },
+              { orgId, branchId, userId, batches: batchTracking },
               movingLines.map((l) => ({
                 productId: l.productId,
                 qty: -l.qty,

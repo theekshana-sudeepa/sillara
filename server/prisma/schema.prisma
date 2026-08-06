@@ -285,6 +285,7 @@ model Branch {
   sales          Sale[]
   stock          BranchStock[]
   movements      StockMovement[]
+  batches        StockBatch[]
   shifts         Shift[]
   purchaseOrders PurchaseOrder[]
   staff          OrgUser[]
@@ -436,6 +437,7 @@ model Product {
   saleItems SaleItem[]
   movements StockMovement[]
   branchStock BranchStock[]
+  batches     StockBatch[]
   poItems   PurchaseOrderItem[]
 
   parent   Product?  @relation("ProductVariants", fields: [parentId], references: [id], onDelete: Cascade)
@@ -672,6 +674,45 @@ model SaleItem {
   @@map("sale_items")
 }
 
+/// A delivery of one product with one expiry date.
+///
+/// Pharmacy, grocery and bakery all need to answer "what is going out of date,
+/// and how much of it" — and to sell the oldest first without the cashier
+/// thinking about it. A batch is created on receipt and consumed automatically
+/// at the till, oldest expiry first.
+///
+/// `qty` is a cache, like every other balance here: the truth is the sum of
+/// the stock movements carrying this `batchId`. `reconcile` checks it.
+model StockBatch {
+  id        String    @id @default(cuid())
+  orgId     String
+  productId String
+  /// A batch lives at a place. Selling in Kandy must not consume Colombo's
+  /// stock, and an expiry report is per-shelf.
+  branchId  String?
+  /// The supplier's lot number, when there is one.
+  batchNo   String?   @db.VarChar(60)
+  /// Null means "does not expire" — sorted last, so dated stock always goes
+  /// out before undated stock.
+  expiresAt DateTime? @db.Date
+  qty       Decimal   @default(0.000) @db.Decimal(12, 3)
+  /// What this particular delivery cost, which is what margin should use.
+  unitCost  Decimal?  @db.Decimal(12, 2)
+
+  receivedAt DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  branch    Branch?         @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  movements StockMovement[]
+
+  // The FEFO pick: this product, this branch, still holding stock, earliest
+  // expiry first. One index answers the whole allocation.
+  @@index([orgId, productId, branchId, expiresAt])
+  @@index([orgId, expiresAt])
+  @@map("stock_batches")
+}
+
 /// Immutable stock ledger. `stockQty` on Product is the cached balance; this
 /// table is the truth of HOW it got there — every sale, receive, void and
 /// correction is one signed row. Enterprise POS reporting grows from here.
@@ -687,13 +728,18 @@ model StockMovement {
   refType   String?       @db.VarChar(20)    // "sale" | "receive_batch"
   refId     String?       @db.VarChar(64)
   createdById String?
+  /// Which batch moved. Null for products nobody tracks batches on, and for
+  /// the remainder when a sale outran every batch on the shelf.
+  batchId   String?
 
   createdAt DateTime @default(now())
 
-  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
-  branch  Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  product Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  branch  Branch?     @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  batch   StockBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
 
   @@index([orgId, productId, createdAt])
+  @@index([batchId])
   @@index([orgId, branchId, createdAt])
   @@index([orgId, type, createdAt])
   @@map("stock_movements")
