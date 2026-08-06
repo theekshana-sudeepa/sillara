@@ -11,6 +11,7 @@ import { logger } from '../../lib/logger.js';
 import { NotFound, Conflict, BadRequest } from '../../lib/errors.js';
 import { computeLoyalty } from '../loyalty/loyalty.routes.js';
 import { postStock, resolveBranchId } from '../../domain/stock.js';
+import { assertSellable } from '../../domain/variants.js';
 import { resolveSaleRefs } from '../../domain/tenancy.js';
 import { settle, settleLegacy } from '../../domain/payments.js';
 import { postCredit, creditPortion } from '../../domain/credit.js';
@@ -143,10 +144,15 @@ salesRouter.post(
           const products = lineProductIds.length
             ? await tx.product.findMany({
                 where: { id: { in: lineProductIds }, orgId, deletedAt: null },
-                select: { id: true, trackStock: true, taxRate: true, cost: true },
+                select: { id: true, name: true, trackStock: true, taxRate: true, cost: true, variantOptions: true },
               })
             : [];
           const byId = new Map(products.map((p) => [p.id, p]));
+
+          // A variant parent is a folder, not a thing on the shelf. Ringing
+          // one up would take money for an unidentified item and move no
+          // stock — so the line fails and the device keeps it to be fixed.
+          for (const product of products) assertSellable(product);
 
           // The other three device-supplied ids. Anything this org does not
           // own is dropped rather than written — see domain/tenancy.ts for why

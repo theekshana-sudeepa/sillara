@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
 import { useSession } from '@/state/store';
@@ -11,6 +11,28 @@ interface QuickProduct {
   name: string;
   price: string;
 }
+
+interface BusinessTypeOption {
+  value: string;
+  label: string;
+}
+
+/** One glyph per trade — faster to scan than a dropdown of thirteen. */
+const TYPE_ICON: Record<string, string> = {
+  GENERAL_RETAIL: '🏪',
+  GROCERY: '🛒',
+  PHARMACY: '💊',
+  BAKERY: '🥖',
+  CLOTHING: '👕',
+  ELECTRONICS: '🔌',
+  MOBILE: '📱',
+  HARDWARE: '🔧',
+  BOOKSHOP: '📚',
+  SERVICE: '🛠️',
+  RESTAURANT: '🍽️',
+  SALON: '💇',
+  OTHER: '✨',
+};
 
 const STEPS = [
   { icon: '🏪', title: 'Your shop' },
@@ -46,6 +68,23 @@ export default function SetupWizard() {
   const [added, setAdded] = useState(0);
   const [shelfieOpen, setShelfieOpen] = useState(false);
 
+  // step 1 — what kind of shop. Optional: skipping leaves the general retail
+  // preset the shop already provisioned with, which sells perfectly well.
+  const [types, setTypes] = useState<BusinessTypeOption[]>([]);
+  const [businessType, setBusinessType] = useState<string | null>(null);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const res = await api.get<{ businessTypes: BusinessTypeOption[]; businessType: string }>('/org/capabilities');
+        setTypes(res.businessTypes);
+        // Only pre-select if the shop was provisioned with a real choice —
+        // the default must not look like an answer they already gave.
+        if (res.businessType && res.businessType !== 'GENERAL_RETAIL') setBusinessType(res.businessType);
+      } catch { /* offline — the picker is a nicety, not a gate */ }
+    })();
+  }, []);
+
   const saveIdentity = async () => {
     setBusy(true);
     try {
@@ -56,6 +95,14 @@ export default function SetupWizard() {
         language,
       });
       setLang(language);
+
+      // Applying the preset swaps the starter catalogue and switches on the
+      // capabilities this trade actually uses. Untouched samples from the
+      // previous preset are cleared server-side.
+      if (businessType) {
+        await api.patch('/org/business-type', { businessType, seedCatalog: true });
+        await refreshCatalog();
+      }
     } catch { /* offline or transient — never block the wizard */ }
     setBusy(false);
     setStep(1);
@@ -112,6 +159,36 @@ export default function SetupWizard() {
           <p className="mt-1 text-sm text-muted-foreground">This prints on every receipt your customers take home.</p>
 
           <div className="mt-6 flex flex-col gap-4">
+            {types.length > 0 ? (
+              <div>
+                <label className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                  What do you sell? <span className="font-normal normal-case">(optional)</span>
+                </label>
+                <p className="mt-1 text-[12.5px] text-muted-foreground">
+                  Sets up your categories and switches on the tools your trade uses. Change it any time.
+                </p>
+                <div className="mt-2.5 grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {types.map((type) => {
+                    const selected = businessType === type.value;
+                    return (
+                      <button
+                        key={type.value}
+                        type="button"
+                        aria-pressed={selected}
+                        onClick={() => setBusinessType(selected ? null : type.value)}
+                        className={`pressable flex flex-col items-center gap-1 rounded-xl border px-2 py-3 text-center transition-colors ${
+                          selected ? 'border-primary bg-primary/10' : 'border-border bg-card hover:border-ring'
+                        }`}
+                      >
+                        <span className="text-[20px]" aria-hidden>{TYPE_ICON[type.value] ?? '🏪'}</span>
+                        <span className="text-[11px] font-semibold leading-tight">{type.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+
             <div>
               <label htmlFor="rh" className="text-xs font-bold uppercase tracking-wide text-muted-foreground">Receipt name</label>
               <input id="rh" value={receiptHeader} onChange={(e) => setReceiptHeader(e.target.value)}

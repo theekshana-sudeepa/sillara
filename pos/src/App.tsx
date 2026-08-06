@@ -17,6 +17,7 @@ import SalesPage from '@/pages/SalesPage';
 import SettingsPage from '@/pages/SettingsPage';
 import PublicReceiptPage from '@/pages/PublicReceiptPage';
 import SupplierPortalPage from '@/pages/SupplierPortalPage';
+import { moduleElements } from '@/modules/registry';
 
 function Splash() {
   return (
@@ -230,6 +231,12 @@ function AppRoutes() {
         <Route path="/sales" element={<SalesPage />} />
         <Route path="/business" element={<BusinessPage />} />
         <Route path="/settings" element={<SettingsPage />} />
+        {/* Vertical modules. Declared once in modules/registry.tsx; each is
+            code-split and gated on its capability, so a shop only downloads
+            what it can actually use. */}
+        {moduleElements.map(({ path, Element }) => (
+          <Route key={path} path={`/${path}`} element={<Element />} />
+        ))}
       </Route>
       <Route path="*" element={<Navigate to="/sell" replace />} />
     </Routes>

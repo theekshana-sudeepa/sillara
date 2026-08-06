@@ -5,8 +5,10 @@ import { prisma } from '../../lib/prisma.js';
 import { asyncHandler, ok } from '../../lib/http.js';
 import { validate } from '../../middleware/validate.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
+import { requireCapability } from '../../middleware/org.js';
 import { money } from '../../lib/money.js';
-import { NotFound, PlanLimit, Conflict } from '../../lib/errors.js';
+import { NotFound, PlanLimit, Conflict, BadRequest } from '../../lib/errors.js';
+import { buildCombinations, attributeKey, type VariantOption } from '../../domain/variants.js';
 import { extractInvoiceItems, extractProductsFromImages, shelfieEnabled } from '../../services/shelfie.js';
 import { logger } from '../../lib/logger.js';
 import { postStock, setStockLevel, resolveBranchId } from '../../domain/stock.js';
@@ -28,8 +30,157 @@ const productSchema = z.object({
 
 const idParam = z.object({ id: z.string().cuid() });
 
+const variantOptionSchema = z.object({
+  name: z.string().trim().min(1).max(40),
+  values: z.array(z.string().trim().min(1).max(60)).min(1).max(40),
+});
+
 export const productsRouter = Router();
 productsRouter.use(requireAuth);
+
+/**
+ * Create every variant of a product at once.
+ *
+ * A clothing shop thinks in "T-Shirt, S/M/L, red and blue" — six things on the
+ * shelf, entered once. Each combination becomes its own product row, so it
+ * gets its own barcode, price and stock without the ledger knowing variants
+ * exist. The parent is a folder: no stock, and the sale path refuses it.
+ */
+productsRouter.post(
+  '/variants',
+  requireRole('MANAGER'),
+  requireCapability('stock.variants'),
+  validate({
+    body: productSchema.extend({
+      options: z.array(variantOptionSchema).min(1).max(3),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const body = req.body as z.infer<typeof productSchema> & { options: VariantOption[] };
+
+    const combinations = buildCombinations(body.name, body.options);
+
+    const org = await prisma.organization.findUniqueOrThrow({ where: { id: orgId }, include: { plan: true } });
+    if (org.plan.maxProducts >= 0) {
+      const count = await prisma.product.count({ where: { orgId, deletedAt: null } });
+      // The parent counts too — it occupies a row and shows on the grid.
+      if (count + combinations.length + 1 > org.plan.maxProducts) {
+        throw PlanLimit(
+          `That is ${combinations.length} variants, and the ${org.plan.name} plan allows ${org.plan.maxProducts} products. Upgrade to add them.`,
+        );
+      }
+    }
+
+    const created = await prisma.$transaction(async (tx) => {
+      const parent = await tx.product.create({
+        data: {
+          orgId,
+          name: body.name,
+          categoryId: body.categoryId ?? null,
+          price: money(body.price),
+          cost: money(body.cost),
+          taxRate: body.taxRate == null ? null : new Prisma.Decimal(body.taxRate),
+          unit: body.unit,
+          isActive: body.isActive,
+          // A folder holds nothing. Stock lives on the children, and the
+          // rollup for reporting is the sum of them.
+          trackStock: false,
+          stockQty: new Prisma.Decimal(0),
+          variantOptions: body.options as never,
+        },
+      });
+
+      await tx.product.createMany({
+        data: combinations.map((combo) => ({
+          orgId,
+          parentId: parent.id,
+          name: combo.name,
+          categoryId: body.categoryId ?? null,
+          price: money(body.price),
+          cost: money(body.cost),
+          taxRate: body.taxRate == null ? null : new Prisma.Decimal(body.taxRate),
+          unit: body.unit,
+          isActive: body.isActive,
+          trackStock: body.trackStock,
+          // Opening stock is per-variant and nobody has counted it yet; the
+          // owner receives or counts each one. Seeding the same number into
+          // every child would be a lie the ledger then has to carry.
+          stockQty: new Prisma.Decimal(0),
+          variantAttributes: combo.attributes as never,
+        })),
+      });
+
+      return tx.product.findUniqueOrThrow({
+        where: { id: parent.id },
+        include: { variants: { orderBy: { name: 'asc' } } },
+      });
+    });
+
+    logger.info({ orgId, parentId: created.id, variants: combinations.length }, 'variant product created');
+    ok(res, created, 201);
+  }),
+);
+
+/**
+ * Add values to an existing variant product — a new colour arrives mid-season.
+ *
+ * Only the missing combinations are created, so calling this twice with the
+ * same colour is a no-op rather than a duplicate shelf.
+ */
+productsRouter.post(
+  '/:id/variants',
+  requireRole('MANAGER'),
+  requireCapability('stock.variants'),
+  validate({ params: idParam, body: z.object({ options: z.array(variantOptionSchema).min(1).max(3) }) }),
+  asyncHandler(async (req, res) => {
+    const { orgId } = req.auth!;
+    const { options } = req.body as { options: VariantOption[] };
+
+    const parent = await prisma.product.findFirst({
+      where: { id: req.params.id!, orgId, deletedAt: null },
+      include: { variants: { where: { deletedAt: null } } },
+    });
+    if (!parent) throw NotFound('Product');
+    if (!parent.variantOptions) throw BadRequest(`"${parent.name}" does not have variants`);
+
+    const combinations = buildCombinations(parent.name, options);
+    const existing = new Set(
+      parent.variants.map((v) => attributeKey((v.variantAttributes ?? {}) as Record<string, string>)),
+    );
+    const missing = combinations.filter((c) => !existing.has(c.key));
+
+    if (missing.length === 0) {
+      ok(res, { added: 0, parent });
+      return;
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.product.createMany({
+        data: missing.map((combo) => ({
+          orgId,
+          parentId: parent.id,
+          name: combo.name,
+          categoryId: parent.categoryId,
+          price: parent.price,
+          cost: parent.cost,
+          taxRate: parent.taxRate,
+          unit: parent.unit,
+          trackStock: parent.variants[0]?.trackStock ?? false,
+          stockQty: new Prisma.Decimal(0),
+          variantAttributes: combo.attributes as never,
+        })),
+      });
+      // The option list is what the picker renders, so it has to grow too.
+      await tx.product.update({
+        where: { id: parent.id },
+        data: { variantOptions: options as never },
+      });
+    });
+
+    ok(res, { added: missing.length }, 201);
+  }),
+);
 
 /**
  * The POS bootstrap: full catalog in one call, cached into IndexedDB by the
@@ -175,6 +326,12 @@ productsRouter.patch(
           ...(body.cost !== undefined ? { cost: money(body.cost) } : {}),
         },
       });
+
+      // A folder has no shelf. Stock belongs to the variant, and letting the
+      // parent carry a number would double-count it in every valuation.
+      if (stockQty !== undefined && existing.variantOptions) {
+        throw BadRequest(`"${existing.name}" has variants — set stock on the size or colour, not the group`);
+      }
 
       if (stockQty !== undefined && Number(stockQty) !== Number(existing.stockQty)) {
         const branchId = await resolveBranchId(tx, orgId);

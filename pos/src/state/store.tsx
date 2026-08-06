@@ -1,7 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useState } from 'react';
 import { api, getToken, setToken } from '@/lib/api';
-import { cacheBootstrap, getCachedOrg, type CachedOrg, type CachedProduct } from '@/lib/db';
+import { cacheBootstrap, getCachedOrg, kvGet, kvSet, type CachedOrg, type CachedProduct } from '@/lib/db';
 import { setLang, type Lang } from '@/lib/i18n';
+import { DEFAULT_CAPABILITIES, type CapabilityId, type CapabilityState } from '@/lib/capabilities';
 
 // --- session ----------------------------------------------------------------
 
@@ -14,9 +15,19 @@ interface SessionContextValue {
   session: Session | null;
   status: 'loading' | 'ready' | 'anonymous';
   online: boolean;
+  /** Resolved server-side. Never derived from business type on the client. */
+  capabilities: CapabilityState;
   signIn: (token: string, session: Session) => void;
   signOut: () => void;
   refreshCatalog: () => Promise<void>;
+}
+
+interface MeResponse {
+  user: Session['user'];
+  org: CachedOrg & { status: string; plan: string };
+  capabilities: CapabilityId[];
+  blockedByPlan: CapabilityId[];
+  layout: CapabilityState['layout'];
 }
 
 const SessionContext = createContext<SessionContextValue | null>(null);
@@ -25,6 +36,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [status, setStatus] = useState<SessionContextValue['status']>('loading');
   const [online, setOnline] = useState(navigator.onLine);
+  const [capabilities, setCapabilities] = useState<CapabilityState>(DEFAULT_CAPABILITIES);
 
   useEffect(() => {
     const up = () => setOnline(true);
@@ -43,6 +55,27 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   /**
+   * Ask the server who we are and what this till can do, and cache the answer.
+   *
+   * Cached because the shape of the till is not something to lose when the
+   * router goes down: a pharmacy that reboots offline must still open with
+   * batch entry on the screen.
+   */
+  const syncIdentity = useCallback(async (): Promise<void> => {
+    const me = await api.get<MeResponse>('/auth/me');
+    const next: CapabilityState = {
+      active: me.capabilities ?? DEFAULT_CAPABILITIES.active,
+      blockedByPlan: me.blockedByPlan ?? [],
+      layout: me.layout ?? DEFAULT_CAPABILITIES.layout,
+    };
+    setSession({ user: me.user, org: me.org });
+    setCapabilities(next);
+    setLang((me.org.language as Lang) ?? 'en');
+    setStatus('ready');
+    await kvSet('capabilities', next);
+  }, []);
+
+  /**
    * Boot order is offline-first by design:
    *   1. token + cached org present → open the till IMMEDIATELY from cache
    *   2. then try the network in the background to refresh the catalog
@@ -55,18 +88,16 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         setStatus('anonymous');
         return;
       }
-      const cachedOrg = await getCachedOrg();
+      const [cachedOrg, cachedCaps] = await Promise.all([getCachedOrg(), kvGet<CapabilityState>('capabilities')]);
+      if (cachedCaps && !cancelled) setCapabilities(cachedCaps);
       if (cachedOrg && !cancelled) {
         setSession({ user: { id: '', name: '', email: '', role: 'CASHIER' }, org: cachedOrg });
         setLang((cachedOrg.language as Lang) ?? 'en');
         setStatus('ready');
       }
       try {
-        const me = await api.get<{ user: Session['user']; org: CachedOrg & { status: string; plan: string } }>('/auth/me');
+        await syncIdentity();
         if (cancelled) return;
-        setSession({ user: me.user, org: me.org });
-        setLang((me.org.language as Lang) ?? 'en');
-        setStatus('ready');
         await refreshCatalog();
       } catch {
         // Offline with a cache → keep selling. No cache and no network → login.
@@ -83,18 +114,23 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     setSession(s);
     setLang((s.org.language as Lang) ?? 'en');
     setStatus('ready');
+    // The login response carries a session but not the till's shape; fetch it
+    // before the catalogue so the sell screen mounts the right shell.
+    void syncIdentity().catch(() => undefined);
     void refreshCatalog();
-  }, [refreshCatalog]);
+  }, [refreshCatalog, syncIdentity]);
 
   const signOut = useCallback(() => {
     setToken(null);
     setSession(null);
+    setCapabilities(DEFAULT_CAPABILITIES);
     setStatus('anonymous');
+    void kvSet('capabilities', null);
   }, []);
 
   const value = useMemo(
-    () => ({ session, status, online, signIn, signOut, refreshCatalog }),
-    [session, status, online, signIn, signOut, refreshCatalog],
+    () => ({ session, status, online, capabilities, signIn, signOut, refreshCatalog }),
+    [session, status, online, capabilities, signIn, signOut, refreshCatalog],
   );
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
@@ -105,6 +141,27 @@ export function useSession(): SessionContextValue {
   const ctx = useContext(SessionContext);
   if (!ctx) throw new Error('useSession outside provider');
   return ctx;
+}
+
+/**
+ * The only question a screen should ask about what it may render.
+ *
+ *   const can = useCapability();
+ *   {can('stock.batches') ? <BatchPicker /> : null}
+ *
+ * Never `session.org.businessType === 'PHARMACY'`. A café can want tables and
+ * a hardware shop can want batches; the label is not the rule.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export function useCapability(): (id: CapabilityId) => boolean {
+  const { capabilities } = useSession();
+  return useCallback((id: CapabilityId) => capabilities.active.includes(id), [capabilities]);
+}
+
+/** The sell-screen shape and quick-cash keys for this shop. */
+// eslint-disable-next-line react-refresh/only-export-components
+export function useLayout(): CapabilityState['layout'] {
+  return useSession().capabilities.layout;
 }
 
 // --- cart -------------------------------------------------------------------

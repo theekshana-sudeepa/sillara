@@ -7,7 +7,9 @@ import { enqueue, flushEmails } from './email/outbox.js';
 import { activationEmail } from './email/templates.js';
 import { addMonths } from './lifecycle.js';
 import { awardReferral } from '../modules/referrals/referrals.routes.js';
-import { Prisma } from '@prisma/client';
+import { seedCatalog } from '../capabilities/seed.js';
+import { templateFor } from '../capabilities/templates.js';
+import type { BusinessType } from '@prisma/client';
 
 /**
  * ---------------------------------------------------------------------------
@@ -50,15 +52,10 @@ const COUNTRY_DEFAULTS: Record<string, { currency: string; timezone: string; lan
 export const defaultsForCountry = (country: string) =>
   COUNTRY_DEFAULTS[country.toUpperCase()] ?? { currency: 'USD', timezone: 'Etc/UTC', language: 'en' };
 
-/** Starter catalog — the shop must LOOK alive the second the owner walks in. */
-const SAMPLE_CATALOG = [
-  { category: 'Drinks', color: '#0EA5E9', items: [{ name: 'Water Bottle 500ml', price: 1.0 }, { name: 'Soft Drink', price: 1.5 }] },
-  { category: 'Snacks', color: '#F59E0B', items: [{ name: 'Biscuits', price: 0.8 }, { name: 'Chips', price: 1.2 }] },
-  { category: 'General', color: '#6366F1', items: [{ name: 'Sample Item — edit me', price: 5.0 }] },
-];
-
-// LKR shops get LKR-shaped sample prices, not $1 water.
-const PRICE_SCALE: Record<string, number> = { LKR: 300, INR: 80, BDT: 110, NPR: 130, PKR: 280, IDR: 15000, NGN: 1500, KES: 130 };
+// The starter catalogue now comes from the business-type template — see
+// capabilities/seed.ts. A pharmacy opens on Prescription and OTC rather than
+// on Drinks and Snacks, and a shop that picked nothing still gets the general
+// retail set, which is exactly what used to live here.
 
 export function slugify(name: string): string {
   const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'shop';
@@ -82,6 +79,13 @@ export interface SignupInput {
   country: string;
   planCode: PlanCode;
   language?: string;
+  /**
+   * Optional, and deliberately so. The marketing funnel asks nothing extra —
+   * a shop that says nothing provisions as general retail and can pick its
+   * preset in the wizard, where the question makes sense and can be skipped.
+   * Anything that adds a step between signup and selling is a regression.
+   */
+  businessType?: BusinessType;
   /**
    * Set when the user chose their password AT signup (in-app flow). The org
    * then activates with zero email round-trips — no codes, no waiting. When
@@ -107,6 +111,7 @@ export async function createPendingOrg(input: SignupInput): Promise<Organization
       timezone: defaults.timezone,
       language: input.language ?? defaults.language,
       planCode: input.planCode,
+      businessType: input.businessType ?? 'GENERAL_RETAIL',
       status: 'PENDING',
       receiptHeader: input.shopName,
       receiptFooter: 'Thank you! · Powered by Sillara — sillara.com',
@@ -168,22 +173,18 @@ export async function provisionOrg(
     return { org, activationUrl, alreadyProvisioned: true };
   }
 
-  const scale = PRICE_SCALE[org.currency] ?? 1;
-
   const updated = await prisma.$transaction(async (tx) => {
-    for (const [i, group] of SAMPLE_CATALOG.entries()) {
-      const category = await tx.category.create({
-        data: { orgId, name: group.category, color: group.color, sortOrder: i },
-      });
-      await tx.product.createMany({
-        data: group.items.map((item) => ({
-          orgId,
-          categoryId: category.id,
-          name: item.name,
-          price: new Prisma.Decimal(Math.round(item.price * scale * 100) / 100),
-        })),
-      });
-    }
+    await seedCatalog(tx, { orgId, businessType: org.businessType, currency: org.currency });
+
+    // The preset's layout is written once, at provisioning. After this it is
+    // the owner's — changing business type later will not overwrite it.
+    const template = templateFor(org.businessType);
+    await tx.organization.update({
+      where: { id: orgId },
+      data: {
+        layout: template.layout as never,
+      },
+    });
 
     // Every org gets exactly one branch. Single-shop tenants never see the
     // concept; multi-branch is purely additive on top of this row.

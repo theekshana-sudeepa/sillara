@@ -10,6 +10,7 @@ import { invalidateOrgCache } from '../../middleware/org.js';
 import { DUMMY_PASSWORD_HASH, hashPassword, hashPin, sha256, verifyPassword, verifyPin } from '../../lib/crypto.js';
 import { BadRequest, Unauthorized, Conflict, NotFound, Forbidden } from '../../lib/errors.js';
 import { audit } from '../../lib/audit.js';
+import { resolveCapabilities } from '../../capabilities/resolve.js';
 
 const passwordSchema = z.string().min(8, 'At least 8 characters').max(128);
 
@@ -142,6 +143,15 @@ authRouter.post(
   }),
 );
 
+/**
+ * Everything the till needs to draw itself.
+ *
+ * Capabilities are resolved server-side and shipped here, so the client never
+ * re-derives them from business type — it cannot, and it must not try. The
+ * till asks "can I do X?"; the answer arrives already decided, with the plan
+ * applied. `blockedByPlan` comes too, because a shop should be told what it is
+ * missing rather than shown a smaller product with no explanation.
+ */
 authRouter.get(
   '/me',
   requireAuth,
@@ -151,6 +161,14 @@ authRouter.get(
       include: { org: { include: { plan: true } } },
     });
     if (!user) throw Unauthorized();
+
+    const resolved = resolveCapabilities({
+      businessType: user.org.businessType,
+      overrides: user.org.capabilities,
+      planFeatures: (user.org.plan.features as string[] | null) ?? [],
+      layout: user.org.layout,
+    });
+
     ok(res, {
       user: { id: user.id, name: user.name, email: user.email, role: user.role },
       org: {
@@ -163,7 +181,11 @@ authRouter.get(
         status: user.org.status,
         plan: user.org.planCode,
         trialEndsAt: user.org.trialEndsAt,
+        businessType: user.org.businessType,
       },
+      capabilities: resolved.active,
+      blockedByPlan: resolved.blockedByPlan,
+      layout: resolved.layout,
     });
   }),
 );

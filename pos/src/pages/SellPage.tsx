@@ -7,6 +7,7 @@ import { t } from '@/lib/i18n';
 import { Receipt, type ReceiptData } from '@/components/Receipt';
 import { CustomerPicker, type PickedCustomer } from '@/components/CustomerPicker';
 import { ShiftPanel, type Shift } from '@/components/ShiftPanel';
+import { VariantPicker } from '@/components/VariantPicker';
 import { api } from '@/lib/api';
 import { Icon } from '@/components/Icon';
 
@@ -20,6 +21,7 @@ export default function SellPage() {
   const [categories, setCategories] = useState<CachedCategory[]>([]);
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
   const [search, setSearch] = useState('');
+  const [picking, setPicking] = useState<CachedProduct | null>(null);
   const [payOpen, setPayOpen] = useState(false);
   const [tender, setTender] = useState<Tender>('CASH');
   const [tendered, setTendered] = useState('');
@@ -75,12 +77,32 @@ export default function SellPage() {
 
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase();
+    const searching = q.length > 0;
     return products
       .filter((p) => p.isActive)
+      // Browsing shows one tile per style — a clothing shop with 300 variants
+      // has an unusable grid otherwise. Searching flips it: the cashier who
+      // typed "red" wants the red one, not the folder it lives in.
+      .filter((p) => (searching ? !p.variantOptions : !p.parentId))
       .filter((p) => (activeCategory ? p.categoryId === activeCategory : true))
       .filter((p) => (q ? p.name.toLowerCase().includes(q) || p.sku?.toLowerCase().includes(q) || p.barcode?.includes(q) : true))
       .slice(0, 120);
   }, [products, activeCategory, search]);
+
+  /** Children of the parent currently being picked, from the same cache. */
+  const pickingVariants = useMemo(
+    () => (picking ? products.filter((p) => p.parentId === picking.id && p.isActive) : []),
+    [products, picking],
+  );
+
+  const addProduct = (product: CachedProduct) => {
+    // A parent is a folder. Ask which one, then add the variant itself.
+    if (product.variantOptions) {
+      setPicking(product);
+      return;
+    }
+    dispatch({ type: 'add', product });
+  };
 
   // Loyalty discount is INDICATIVE here — the server recomputes it on sync
   // from the real balance. Never let a device decide what points are worth.
@@ -293,7 +315,7 @@ export default function SellPage() {
               return (
                 <button
                   key={p.id}
-                  onClick={() => dispatch({ type: 'add', product: p })}
+                  onClick={() => addProduct(p)}
                   className="pressable group relative flex min-h-[104px] flex-col justify-between overflow-hidden rounded-2xl border border-border bg-card p-3.5 text-left shadow-e1 hover:border-border-strong hover:shadow-e2"
                 >
                   {/* Category reads as a colour edge, not a coloured price. */}
@@ -594,6 +616,19 @@ export default function SellPage() {
 
       {shiftOpen ? (
         <ShiftPanel onClose={() => setShiftOpen(false)} onChanged={(next) => setShift(next)} />
+      ) : null}
+
+      {picking ? (
+        <VariantPicker
+          parent={picking}
+          variants={pickingVariants}
+          currency={currency}
+          onPick={(variant) => {
+            dispatch({ type: 'add', product: variant });
+            setPicking(null);
+          }}
+          onClose={() => setPicking(null)}
+        />
       ) : null}
 
       {receipt ? <Receipt data={receipt} onClose={() => { setReceipt(null); searchRef.current?.focus(); }} /> : null}

@@ -28,6 +28,16 @@ export interface CachedProduct {
   trackStock: boolean;
   stockQty: number;
   isActive: boolean;
+  /**
+   * Variants. A child is a product in its own right — its own barcode, price
+   * and stock — so everything else here treats it as one. Only the sell grid
+   * and the catalogue screen care about the grouping.
+   */
+  parentId?: string | null;
+  /** On a child: `{ "Size": "M", "Colour": "Red" }`. */
+  variantAttributes?: Record<string, string> | null;
+  /** On a parent: the option list, in display order. Parents are not sellable. */
+  variantOptions?: Array<{ name: string; values: string[] }> | null;
 }
 
 export interface CachedCategory {

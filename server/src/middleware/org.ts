@@ -1,8 +1,10 @@
 import type { NextFunction, Request, Response } from 'express';
-import type { OrgStatus, PlanCode } from '@prisma/client';
+import type { BusinessType, OrgStatus, PlanCode } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
-import { AppError, Unauthorized } from '../lib/errors.js';
+import { AppError, Forbidden, Unauthorized } from '../lib/errors.js';
 import { canWrite } from '../services/lifecycle.js';
+import { resolveCapabilities } from '../capabilities/resolve.js';
+import { CAPABILITIES, type CapabilityId } from '../capabilities/registry.js';
 
 /**
  * ---------------------------------------------------------------------------
@@ -30,6 +32,9 @@ export interface OrgContext {
   maxTerminals: number;
   maxProducts: number;
   maxUsers: number;
+  businessType: BusinessType;
+  /** Resolved once per request, alongside entitlement — see resolveCapabilities. */
+  capabilities: CapabilityId[];
 }
 
 declare global {
@@ -80,7 +85,10 @@ export async function attachOrg(req: Request, _res: Response, next: NextFunction
             currency: true,
             timezone: true,
             deletedAt: true,
-            plan: { select: { maxTerminals: true, maxProducts: true, maxUsers: true } },
+            businessType: true,
+            capabilities: true,
+            layout: true,
+            plan: { select: { maxTerminals: true, maxProducts: true, maxUsers: true, features: true } },
           },
         },
       },
@@ -91,6 +99,16 @@ export async function attachOrg(req: Request, _res: Response, next: NextFunction
       return next(new AppError(401, 'ACCOUNT_INACTIVE', 'This account is no longer active'));
     }
 
+    // Resolved here rather than per-route: it is the same memoised lookup that
+    // already proves entitlement, so capabilities cost nothing extra and every
+    // handler downstream can ask what this shop can do without another query.
+    const resolved = resolveCapabilities({
+      businessType: user.org.businessType,
+      overrides: user.org.capabilities,
+      planFeatures: (user.org.plan.features as string[] | null) ?? [],
+      layout: user.org.layout,
+    });
+
     const org: OrgContext = {
       id: user.org.id,
       status: user.org.status,
@@ -100,6 +118,8 @@ export async function attachOrg(req: Request, _res: Response, next: NextFunction
       maxTerminals: user.org.plan.maxTerminals,
       maxProducts: user.org.plan.maxProducts,
       maxUsers: user.org.plan.maxUsers,
+      businessType: user.org.businessType,
+      capabilities: resolved.active,
     };
     cache.set(key, { at: Date.now(), org });
     req.org = org;
@@ -133,6 +153,37 @@ export function requireWritableOrg(req: Request, _res: Response, next: NextFunct
         : 'Selling is paused while billing is sorted out. Your data is safe and reports still work.',
     ),
   );
+}
+
+/**
+ * Gate a route on a capability.
+ *
+ *   v1.use('/batches', requireAuth, guarded, requireCapability('stock.batches'), batchesRouter);
+ *
+ * This is how a vertical module is mounted: it does not know or care which
+ * kind of shop is calling it, only that the capability is on. The API stops
+ * answering the moment a shop switches the module off, so the till is never
+ * the only thing enforcing it.
+ *
+ * 402 rather than 403 when the plan is the reason — the client already treats
+ * that as "offer the upgrade" rather than "you did something wrong".
+ */
+export function requireCapability(...required: CapabilityId[]) {
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    if (!req.org) return next(Unauthorized());
+
+    const missing = required.filter((id) => !req.org!.capabilities.includes(id));
+    if (missing.length === 0) return next();
+
+    const first = missing[0]!;
+    const def = CAPABILITIES[first];
+    if (def.planFeature) {
+      return next(
+        new AppError(402, 'PLAN_LIMIT', `${def.label} is not included in your plan. Upgrade to switch it on.`),
+      );
+    }
+    next(Forbidden(`${def.label} is switched off for this shop`));
+  };
 }
 
 /** requireAuth → attachOrg → requireWritableOrg, in the order they must run. */

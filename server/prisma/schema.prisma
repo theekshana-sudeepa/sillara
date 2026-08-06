@@ -38,6 +38,30 @@ enum PlanCode {
   PRO
 }
 
+/// What kind of shop this is.
+///
+/// Used in exactly two places: choosing the preset at provisioning, and the
+/// settings screen. It must never appear in business logic — code branches on
+/// *capabilities*, which the preset selects. A café may want tables without
+/// being a RESTAURANT, and a hardware store may want batch tracking; the
+/// moment a vertical name leaks into a conditional, every new vertical means
+/// touching every file that has one.
+enum BusinessType {
+  GENERAL_RETAIL
+  RESTAURANT
+  SALON
+  GROCERY
+  PHARMACY
+  CLOTHING
+  ELECTRONICS
+  HARDWARE
+  MOBILE
+  BAKERY
+  BOOKSHOP
+  SERVICE
+  OTHER
+}
+
 enum UserRole {
   OWNER
   MANAGER
@@ -151,6 +175,18 @@ model Organization {
   timezone  String    @default("Asia/Colombo") @db.VarChar(64)
   language  String    @default("en") @db.VarChar(5)   // en | si | ta
   status    OrgStatus @default(PENDING)
+
+  /// The preset. Changing it re-applies a capability set; it never overwrites
+  /// choices the owner has made — see `capabilities` below.
+  businessType    BusinessType    @default(GENERAL_RETAIL)
+  /// Owner overrides on top of the preset: `{ enabled: [...], disabled: [...] }`.
+  /// Kept separate from the preset so "they chose this" and "the template did"
+  /// stay distinguishable — which is what makes changing business type later
+  /// safe rather than destructive.
+  capabilities    Json?
+  /// Sell-screen shape: which shell, scan-first or tile-first, quick-cash keys.
+  /// Presentation only; nothing here gates behaviour.
+  layout          Json?
 
   planCode        PlanCode        @default(FREE)
   billingProvider BillingProvider @default(MANUAL)
@@ -370,6 +406,27 @@ model Product {
   unit       String  @default("pc") @db.VarChar(12) // pc | kg | l | m
   isActive   Boolean @default(true)
 
+  // --- Variants (stock.variants) -------------------------------------------
+  //
+  // A variant IS a product. "T-Shirt / Red / M" is a row here with its own
+  // barcode, price and stock, pointing at a parent that groups it.
+  //
+  // The alternative — a separate `product_variants` table — is tidier on paper
+  // and would have meant a `variantId` on every stock movement, branch stock
+  // row and sale line. This way the ledger, the tax engine, margin reporting
+  // and the offline outbox all work on variants without knowing they exist.
+  //
+  // A parent is a folder, not a thing you can sell: no price of its own worth
+  // trusting, no stock, and the sale path refuses it.
+  /// Set on a child. Null on a parent and on an ordinary standalone product.
+  parentId          String?
+  /// On a child: `{ "Size": "M", "Colour": "Red" }`.
+  variantAttributes Json?
+  /// On a parent: the option names and their values, in display order —
+  /// S/M/L, not L/M/S. This is what the picker renders and what generates
+  /// the children.
+  variantOptions    Json?
+
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
@@ -381,9 +438,15 @@ model Product {
   branchStock BranchStock[]
   poItems   PurchaseOrderItem[]
 
+  parent   Product?  @relation("ProductVariants", fields: [parentId], references: [id], onDelete: Cascade)
+  variants Product[] @relation("ProductVariants")
+
   @@unique([orgId, sku])
   @@index([orgId, barcode])
   @@index([orgId, isActive, deletedAt])
+  // The sell grid asks for "everything that is not a child" and the variant
+  // picker asks for "the children of this one". Both ride this.
+  @@index([orgId, parentId])
   @@map("products")
 }
 
