@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '@/lib/api';
-import { useSession } from '@/state/store';
+import { useSession, useCapability } from '@/state/store';
 import { money, dateOf, titleCase } from '@/lib/format';
 import { ReceiveGoods } from '@/components/ReceiveGoods';
 
@@ -18,11 +18,26 @@ interface StockProduct {
 
 interface Movement {
   id: string;
-  type: 'SALE' | 'VOID_RETURN' | 'RECEIVE' | 'ADJUST' | 'COUNT';
+  type: 'SALE' | 'VOID_RETURN' | 'REFUND_RETURN' | 'RECEIVE' | 'ADJUST' | 'COUNT' | 'TRANSFER_IN' | 'TRANSFER_OUT';
   qty: string;
   unitCost: string | null;
   note: string | null;
   createdAt: string;
+}
+
+/** How far ahead the expiry banner looks. A month is one ordering cycle. */
+const EXPIRY_HORIZON_DAYS = 30;
+
+interface ExpiringBatch {
+  id: string;
+  product: { id: string; name: string; unit: string };
+  branch: { id: string; name: string } | null;
+  batchNo: string | null;
+  expiresAt: string | null;
+  daysLeft: number | null;
+  expired: boolean;
+  qty: number;
+  valueAtRisk: number | null;
 }
 
 type Sheet =
@@ -34,17 +49,23 @@ type Sheet =
 const MOVE_STYLE: Record<Movement['type'], string> = {
   RECEIVE: 'text-success',
   VOID_RETURN: 'text-info',
+  REFUND_RETURN: 'text-info',
   SALE: 'text-muted-foreground',
   ADJUST: 'text-warning',
   COUNT: 'text-warning',
+  TRANSFER_IN: 'text-info',
+  TRANSFER_OUT: 'text-muted-foreground',
 };
 
 export default function StockPage() {
   const { session, refreshCatalog } = useSession();
+  const tracksBatches = useCapability()("stock.batches");
   const currency = session?.org.currency ?? 'USD';
 
   const [products, setProducts] = useState<StockProduct[]>([]);
   const [low, setLow] = useState<Array<{ id: string; name: string; stockQty: string; lowStockAt: string | null }>>([]);
+  const [expiring, setExpiring] = useState<ExpiringBatch[]>([]);
+  const [expiryOpen, setExpiryOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [lowOnly, setLowOnly] = useState(false);
   const [receiveOpen, setReceiveOpen] = useState(false);
@@ -58,14 +79,19 @@ export default function StockPage() {
 
   const load = useCallback(async () => {
     try {
-      const [list, lowList] = await Promise.all([
+      const [list, lowList, expiry] = await Promise.all([
         api.get<StockProduct[]>('/products', search ? { search } : undefined),
         api.get<typeof low>('/stock/low'),
+        // Only a shop that tracks batches has an expiry answer to give.
+        tracksBatches
+          ? api.get<{ batches: ExpiringBatch[] }>('/stock/expiring', { days: EXPIRY_HORIZON_DAYS })
+          : Promise.resolve({ batches: [] as ExpiringBatch[] }),
       ]);
       setProducts(list.filter((p) => p.trackStock));
       setLow(lowList);
+      setExpiring(expiry.batches);
     } catch { /* offline: sell screen still works from cache */ }
-  }, [search]);
+  }, [search, tracksBatches]);
 
   useEffect(() => {
     const timer = setTimeout(() => void load(), 250);
@@ -119,6 +145,12 @@ export default function StockPage() {
 
   const visible = lowOnly ? products.filter((p) => low.some((l) => l.id === p.id)) : products;
 
+  const expiredCount = expiring.filter((b) => b.expired).length;
+  // What walking it to the bin would cost. The banner leads with this because
+  // "12 batches expiring" is information and "LKR 48,000 at risk" is a reason
+  // to do something today.
+  const valueAtRisk = Math.round(expiring.reduce((s, b) => s + (b.valueAtRisk ?? 0), 0) * 100) / 100;
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2 border-b border-border p-3">
@@ -132,6 +164,34 @@ export default function StockPage() {
 
       {toast ? (
         <p role="status" className="border-b border-border bg-success/10 px-4 py-2 text-center text-sm font-semibold text-success">{toast}</p>
+      ) : null}
+
+      {expiring.length > 0 ? (
+        <button
+          onClick={() => setExpiryOpen(true)}
+          className={`flex items-center gap-2 border-b border-border px-4 py-2.5 text-left text-sm ${
+            expiredCount > 0 ? 'bg-destructive/10' : 'bg-warning/10'
+          }`}
+        >
+          <span aria-hidden>{expiredCount > 0 ? '🚨' : '⏳'}</span>
+          {/* The label has to account for every batch the figure beside it
+              covers. "1 expired" next to the total for twelve reads as one
+              very expensive box. */}
+          <span className={`flex-1 font-semibold ${expiredCount > 0 ? 'text-destructive' : 'text-warning'}`}>
+            {expiredCount > 0
+              ? `${expiredCount} expired${
+                  expiring.length > expiredCount
+                    ? `, ${expiring.length - expiredCount} more within ${EXPIRY_HORIZON_DAYS} days`
+                    : ''
+                }`
+              : `${expiring.length} batch${expiring.length === 1 ? '' : 'es'} expiring within ${EXPIRY_HORIZON_DAYS} days`}
+          </span>
+          {valueAtRisk > 0 ? (
+            <span className={`tabular text-xs font-bold ${expiredCount > 0 ? 'text-destructive' : 'text-warning'}`}>
+              {money(valueAtRisk, currency)}
+            </span>
+          ) : null}
+        </button>
       ) : null}
 
       {low.length > 0 ? (
@@ -278,6 +338,62 @@ export default function StockPage() {
             void refreshCatalog().catch(() => {});
           }}
         />
+      ) : null}
+
+      {expiryOpen ? (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-foreground/50 backdrop-blur-sm sm:items-center"
+          onClick={() => setExpiryOpen(false)}
+        >
+          <div
+            className="flex max-h-[90vh] w-full max-w-lg flex-col rounded-t-2xl bg-card sm:rounded-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="border-b border-border p-4">
+              <h2 className="text-lg font-bold">⏳ Expiring stock</h2>
+              <p className="text-xs text-muted-foreground">
+                Next {EXPIRY_HORIZON_DAYS} days, soonest first. The till already sells these before newer stock.
+              </p>
+            </div>
+
+            <ul className="min-h-0 flex-1 divide-y divide-border overflow-y-auto">
+              {expiring.map((b) => (
+                <li key={b.id} className="flex items-center gap-3 px-4 py-3">
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold">{b.product.name}</p>
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">
+                      {b.batchNo ? <span className="font-medium">Lot {b.batchNo} · </span> : null}
+                      {b.qty} {b.product.unit}
+                      {b.branch ? ` · ${b.branch.name}` : ''}
+                    </p>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <p
+                      className={`text-[12px] font-bold ${
+                        b.expired ? 'text-destructive' : (b.daysLeft ?? 99) <= 7 ? 'text-warning' : 'text-muted-foreground'
+                      }`}
+                    >
+                      {b.expired
+                        ? 'EXPIRED'
+                        : b.daysLeft === 0
+                          ? 'today'
+                          : `${b.daysLeft}d left`}
+                    </p>
+                    {b.valueAtRisk ? (
+                      <p className="tabular text-[11px] text-muted-foreground">{money(b.valueAtRisk, currency)}</p>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ul>
+
+            <div className="border-t border-border p-3">
+              <button onClick={() => setExpiryOpen(false)} className="h-12 w-full rounded-xl bg-secondary text-sm font-semibold">
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </div>
   );

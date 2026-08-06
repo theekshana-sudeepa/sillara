@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '@/lib/api';
-import { useSession } from '@/state/store';
+import { useSession, useCapability } from '@/state/store';
 import { getCachedProducts, type CachedProduct } from '@/lib/db';
 import { money } from '@/lib/format';
 
@@ -29,6 +29,10 @@ interface InvoiceLine {
   matchedName: string | null;
   price: number | null; // selling price, only for new products
   keep: boolean;
+  /// Batch tracking only. A delivery with a lot number or an expiry becomes
+  /// its own batch, which is what the till then sells down oldest-first.
+  batchNo: string;
+  expiresAt: string; // yyyy-mm-dd, as the date input gives it
 }
 
 type Phase = 'pick' | 'reading' | 'review' | 'saving';
@@ -52,6 +56,8 @@ async function downscale(file: File): Promise<{ data: string; mediaType: 'image/
 
 export function ReceiveGoods({ onClose, onDone }: { onClose: () => void; onDone: (summary: string) => void }) {
   const { session } = useSession();
+  const can = useCapability();
+  const tracksBatches = can('stock.batches');
   const currency = session?.org.currency ?? 'USD';
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -111,6 +117,8 @@ export function ReceiveGoods({ onClose, onDone }: { onClose: () => void; onDone:
             // Suggest a selling price for new items: cost + 25%, rounded.
             price: partial ? null : it.unitCost != null ? Math.round(it.unitCost * 1.25 * 100) / 100 : null,
             keep: true,
+            batchNo: '',
+            expiresAt: '',
           };
         }),
       );
@@ -133,11 +141,17 @@ export function ReceiveGoods({ onClose, onDone }: { onClose: () => void; onDone:
     try {
       const result = await api.post<{ newProducts: number; restocked: number }>('/stock/receive', {
         supplier: supplier.trim() || null,
-        rows: kept.map((l) =>
-          l.productId
-            ? { productId: l.productId, qty: l.quantity, unitCost: l.unitCost }
-            : { name: l.name.trim(), price: l.price, qty: l.quantity, unitCost: l.unitCost },
-        ),
+        rows: kept.map((l) => {
+          // Omitted entirely when empty: a row with no lot and no date is
+          // ordinary stock, and inventing a batch for it would clutter the
+          // expiry report with things that never expire.
+          const batch = tracksBatches
+            ? { ...(l.batchNo.trim() ? { batchNo: l.batchNo.trim() } : {}), ...(l.expiresAt ? { expiresAt: l.expiresAt } : {}) }
+            : {};
+          return l.productId
+            ? { productId: l.productId, qty: l.quantity, unitCost: l.unitCost, ...batch }
+            : { name: l.name.trim(), price: l.price, qty: l.quantity, unitCost: l.unitCost, ...batch };
+        }),
       });
       onDone(
         `✓ Received ${kept.length} line${kept.length === 1 ? '' : 's'} · ${result.restocked} restocked, ${result.newProducts} new`,
@@ -264,6 +278,31 @@ export function ReceiveGoods({ onClose, onDone }: { onClose: () => void; onDone:
                             !l.productId && l.keep && (!l.price || l.price <= 0) ? 'border-destructive' : 'border-input'}`} />
                       </label>
                     </div>
+
+                    {tracksBatches ? (
+                      <div className="mt-2 grid grid-cols-2 gap-2 pl-8">
+                        <label className="block">
+                          <span className="block text-[10px] font-semibold uppercase text-muted-foreground">
+                            Batch / lot
+                          </span>
+                          <input
+                            value={l.batchNo}
+                            placeholder="optional"
+                            onChange={(e) => edit(i, { batchNo: e.target.value })}
+                            className="mt-0.5 h-9 w-full rounded-lg border border-input bg-background px-2 text-sm outline-none focus:border-ring"
+                          />
+                        </label>
+                        <label className="block">
+                          <span className="block text-[10px] font-semibold uppercase text-muted-foreground">Expires</span>
+                          <input
+                            type="date"
+                            value={l.expiresAt}
+                            onChange={(e) => edit(i, { expiresAt: e.target.value })}
+                            className="tabular mt-0.5 h-9 w-full rounded-lg border border-input bg-background px-2 text-sm outline-none focus:border-ring"
+                          />
+                        </label>
+                      </div>
+                    ) : null}
                   </li>
                 ))}
               </ul>
