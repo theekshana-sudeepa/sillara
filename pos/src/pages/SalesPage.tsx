@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 import { useSession } from '@/state/store';
 import { money, receiptNo, timeOf } from '@/lib/format';
 import { t } from '@/lib/i18n';
+import { RefundSheet } from '@/components/RefundSheet';
 
 interface ZReport {
   date: string;
@@ -20,32 +21,48 @@ interface SaleRow {
   total: string;
   tender: string;
   status: string;
+  kind: 'SALE' | 'REFUND';
   soldAt: string;
   cashier: { name: string } | null;
-  items: Array<{ nameSnapshot: string; qty: string }>;
+  items: Array<{
+    id: string;
+    nameSnapshot: string;
+    qty: string;
+    refundedQty: string;
+    unitPrice: string;
+    lineTotal: string;
+  }>;
 }
 
 export default function SalesPage() {
   const { session, online } = useSession();
   const [report, setReport] = useState<ZReport | null>(null);
   const [sales, setSales] = useState<SaleRow[]>([]);
+  const [refunding, setRefunding] = useState<SaleRow | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   const currency = session?.org.currency ?? 'USD';
+
+  const load = useCallback(async () => {
+    try {
+      const [z, list] = await Promise.all([
+        api.get<ZReport>('/sales/z-report'),
+        api.get<SaleRow[]>('/sales', { pageSize: 50 }),
+      ]);
+      setReport(z);
+      setSales(list);
+    } catch {
+      /* stays empty offline — the sell screen is the offline surface */
+    }
+  }, []);
 
   useEffect(() => {
     if (!online) return;
-    void (async () => {
-      try {
-        const [z, list] = await Promise.all([
-          api.get<ZReport>('/sales/z-report'),
-          api.get<SaleRow[]>('/sales', { pageSize: 50 }),
-        ]);
-        setReport(z);
-        setSales(list);
-      } catch {
-        /* stays empty offline — the sell screen is the offline surface */
-      }
-    })();
-  }, [online]);
+    void load();
+  }, [online, load]);
+
+  /** A credit note cannot itself be refunded, and neither can a voided sale. */
+  const refundable = (s: SaleRow) =>
+    s.kind === 'SALE' && s.status !== 'VOID' && s.items.some((i) => Number(i.qty) > Number(i.refundedQty));
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
@@ -95,20 +112,66 @@ export default function SalesPage() {
         )}
       </div>
 
+      {toast ? (
+        <p role="status" className="border-b border-border bg-success/10 px-4 py-2 text-center text-sm font-semibold text-success">
+          {toast}
+        </p>
+      ) : null}
+
       <ul className="divide-y divide-border">
-        {sales.map((s) => (
-          <li key={s.id} className={`flex items-center gap-3 px-4 py-3 ${s.status === 'VOID' ? 'opacity-50' : ''}`}>
-            <span className="min-w-0 flex-1">
-              <span className="tabular block text-sm font-semibold">{receiptNo(s.number)} {s.status === 'VOID' ? '· VOID' : ''}</span>
-              <span className="block truncate text-xs text-muted-foreground">
-                {timeOf(s.soldAt)} · {s.items.length} items · {s.cashier?.name ?? '—'}
+        {sales.map((s) => {
+          const isRefund = s.kind === 'REFUND';
+          const canRefund = refundable(s);
+          const partly = !isRefund && s.items.some((i) => Number(i.refundedQty) > 0);
+          return (
+            <li
+              key={s.id}
+              className={`flex items-center gap-3 px-4 py-3 ${s.status === 'VOID' ? 'opacity-50' : ''}`}
+            >
+              <span className="min-w-0 flex-1">
+                <span className="tabular block text-sm font-semibold">
+                  {isRefund ? 'Credit note ' : ''}
+                  {receiptNo(s.number)}
+                  {s.status === 'VOID' ? ' · VOID' : ''}
+                  {partly ? <span className="ml-1.5 text-[11px] font-bold text-warning">· part refunded</span> : null}
+                </span>
+                <span className="block truncate text-xs text-muted-foreground">
+                  {timeOf(s.soldAt)} · {s.items.length} items · {s.cashier?.name ?? '—'}
+                </span>
               </span>
-            </span>
-            <span className="text-xs text-muted-foreground">{s.tender}</span>
-            <span className="tabular text-sm font-bold">{money(Number(s.total), currency)}</span>
-          </li>
-        ))}
+
+              {canRefund ? (
+                <button
+                  onClick={() => setRefunding(s)}
+                  className="pressable shrink-0 rounded-lg bg-secondary px-3 py-1.5 text-[12px] font-bold hover:bg-secondary-hover"
+                >
+                  Refund
+                </button>
+              ) : (
+                <span className="text-xs text-muted-foreground">{s.tender}</span>
+              )}
+
+              <span className={`tabular text-sm font-bold ${isRefund ? 'text-destructive' : ''}`}>
+                {money(Number(s.total), currency)}
+              </span>
+            </li>
+          );
+        })}
       </ul>
+
+      {refunding ? (
+        <RefundSheet
+          sale={refunding}
+          currency={currency}
+          onClose={() => setRefunding(null)}
+          onDone={(summary) => {
+            setRefunding(null);
+            setToast(summary);
+            setTimeout(() => setToast(null), 4000);
+            void load();
+          }}
+        />
+      ) : null}
     </div>
   );
 }

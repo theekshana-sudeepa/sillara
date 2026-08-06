@@ -142,6 +142,9 @@ export const CAPABILITIES: Record<CapabilityId, CapabilityDef> = {
     label: 'Size & colour variants',
     description: 'One product, many variants — each with its own barcode and stock',
   },
+  // NOT offered by any preset until the module exists — switching it on today
+  // would light up a capability with nothing behind it, which is the same
+  // mistake as listing Restaurant before tables shipped.
   'stock.serials': {
     id: 'stock.serials',
     label: 'Serial numbers & IMEI',

@@ -140,7 +140,7 @@ export const TEMPLATES: Record<BusinessType, BusinessTemplate> = {
   ELECTRONICS: {
     label: 'Electronics store',
     status: 'ready',
-    capabilities: [...RETAIL_BASE, 'stock.variants', 'stock.serials', 'purchase_orders'],
+    capabilities: [...RETAIL_BASE, 'stock.variants', 'purchase_orders'],
     layout: { ...DEFAULT_LAYOUT, scanFirst: true },
     defaultUnit: 'pc',
     categories: [
@@ -153,7 +153,7 @@ export const TEMPLATES: Record<BusinessType, BusinessTemplate> = {
   MOBILE: {
     label: 'Mobile shop',
     status: 'ready',
-    capabilities: [...RETAIL_BASE, 'stock.variants', 'stock.serials'],
+    capabilities: [...RETAIL_BASE, 'stock.variants'],
     layout: { ...DEFAULT_LAYOUT, scanFirst: true },
     defaultUnit: 'pc',
     categories: [
@@ -166,7 +166,7 @@ export const TEMPLATES: Record<BusinessType, BusinessTemplate> = {
   HARDWARE: {
     label: 'Hardware store',
     status: 'ready',
-    capabilities: [...RETAIL_BASE, 'stock.serials', 'purchase_orders'],
+    capabilities: [...RETAIL_BASE, 'purchase_orders'],
     layout: { ...DEFAULT_LAYOUT, scanFirst: true, tileSize: 'sm' },
     defaultUnit: 'pc',
     categories: [

@@ -331,3 +331,45 @@ describeDb('an account sale creates a debt somebody can collect', () => {
     expect(res.body.data.results[0].status).toBe('failed');
   });
 });
+
+// ---------------------------------------------------------------------------
+
+describeDb('a refund goes back the way the cashier says', () => {
+  it('settles the whole refund on a chosen tender, working the amount out itself', async () => {
+    const shop = await createShop('Refund Tender Shop');
+    const sale = await shop.api('post', '/sales/sync').send({
+      sales: [saleBody({ items: [{ name: 'Item', unitPrice: 333.33, qty: 3 }], tender: 'CARD', tendered: 999.99 })],
+    });
+    const saleId = sale.body.data.results[0].id as string;
+    const line = await prisma.saleItem.findFirstOrThrow({ where: { saleId } });
+
+    // The till never sends an amount. A device computing the proportional
+    // refund itself can land a cent off the server's figure, and the
+    // settlement would be rejected for not adding up — on a number the
+    // cashier has already handed over.
+    const res = await shop
+      .api('post', `/sales/${saleId}/refund`)
+      .send({ reason: 'Customer returned one', lines: [{ saleItemId: line.id, qty: 1 }], refundTender: 'CASH' });
+
+    expect(res.status).toBe(201);
+
+    const payments = await prisma.salePayment.findMany({ where: { saleId: res.body.data.id } });
+    expect(payments).toHaveLength(1);
+    expect(payments[0]!.type).toBe('CASH'); // not the CARD it was sold on
+    expect(Number(payments[0]!.amount)).toBe(Number(res.body.data.total));
+    expect(Number(payments[0]!.amount)).toBeLessThan(0);
+  });
+
+  it('falls back to the original tender when no choice is made', async () => {
+    const shop = await createShop('Default Tender Shop');
+    const sale = await shop.api('post', '/sales/sync').send({
+      sales: [saleBody({ items: [{ name: 'Item', unitPrice: 200, qty: 1 }], tender: 'QR', tendered: 200 })],
+    });
+    const saleId = sale.body.data.results[0].id as string;
+
+    const res = await shop.api('post', `/sales/${saleId}/refund`).send({ reason: 'Not needed' });
+
+    const payments = await prisma.salePayment.findMany({ where: { saleId: res.body.data.id } });
+    expect(payments[0]!.type).toBe('QR');
+  });
+});

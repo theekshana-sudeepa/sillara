@@ -499,6 +499,13 @@ salesRouter.post(
         .min(1)
         .max(200)
         .optional(),
+      /// Give it all back on one tender, letting the server work out how much.
+      ///
+      /// The common case by a distance, and the safe one: a till computing the
+      /// proportional refund itself can land a cent away from the server's
+      /// figure, and the settlement would then be rejected for not adding up.
+      /// Use `payments` below only to split a refund across tenders.
+      refundTender: z.enum(['CASH', 'CARD', 'QR', 'CREDIT', 'OTHER']).optional(),
       payments: z
         .array(
           z.object({
@@ -517,6 +524,7 @@ salesRouter.post(
     const body = req.body as {
       reason: string;
       lines?: Array<{ saleItemId: string; qty: number }>;
+      refundTender?: TenderType;
       payments?: Array<{ type: TenderType; amount: number; reference?: string | null }>;
     };
 
@@ -580,7 +588,9 @@ salesRouter.post(
 
       const settlement = body.payments
         ? settle(total.negated(), body.payments.map((p) => ({ ...p, amount: -Math.abs(p.amount) })))
-        : settleLegacy(total.negated(), original.tender, 0);
+        : // Whole amount on one tender — the cashier's choice if they made
+          // one, otherwise back the way it came in.
+          settleLegacy(total.negated(), body.refundTender ?? original.tender, 0);
 
       const number = await nextSaleNumber(orgId, tx);
 
