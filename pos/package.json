@@ -1,7 +1,9 @@
 {
   "name": "@sillara/pos",
-  "private": true,
   "version": "0.1.0",
+  "license": "MIT",
+  "author": "Theekshana Sudeepa",
+  "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
