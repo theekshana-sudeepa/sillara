@@ -74,10 +74,24 @@ web_modules/
 
 # dotenv environment variable files
 .env
-.env.development.local
-.env.test.local
-.env.production.local
-.env.local
+.env.*
+!.env.example
+
+# Keys, certificates & signing artifacts
+*.key
+*.pem
+*.p12
+*.jks
+*.keystore
+*.cert
+
+# Personal workspace, IDE & OS files
+.claude/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+docs/LAUNCH.md
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
