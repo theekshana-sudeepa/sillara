@@ -20,6 +20,75 @@ Built for sub-100ms checkout latency online or offline, capability-driven vertic
 
 ---
 
+## Live POS Interface Preview
+
+> Captured directly from the production React 19 + Tailwind CSS 4 PWA (`pos/`) running in offline-capable counter mode with multi-tenant capabilities enabled (`stock.batches`, `loyalty`, `shifts`).
+
+<div align="center">
+  <img src="docs/screenshots/pos-checkout-desktop.png" alt="Sillara Desktop POS Checkout Terminal — Sub-100ms offline-first checkout, barcode/text search, shift indicator, and live cart" width="100%" />
+  <p><sub><b>Desktop POS Checkout Terminal (1440×900)</b> — IndexedDB-backed product grid with color-coded category strips, keyboard-first barcode search, live shift badge, instant cart reducer, and persistent offline sync indicator.</sub></p>
+</div>
+
+<table>
+  <tr>
+    <td width="76%" align="center" valign="top">
+      <img src="docs/screenshots/pos-inventory-fefo.png" alt="Sillara FEFO Batch Expiry & Stock Ledger — Value-at-risk alerts, reorder thresholds, and stocktake actions" width="100%" />
+      <br />
+      <sub><b>FEFO Batch Expiry &amp; Stock Ledger</b> — Surfaces expiring lots with value-at-risk totals, low-stock reorder filters, unit cost vs. price visibility, and append-only ledger adjustments.</sub>
+    </td>
+    <td width="24%" align="center" valign="top">
+      <img src="docs/screenshots/pos-mobile-terminal.png" alt="Sillara Mobile Responsive POS Terminal — Multi-tenant header, live sync pill, touch-first product tiles, and floating charge bar" width="100%" />
+      <br />
+      <sub><b>Mobile Counter Terminal</b> — Touch-first 48–56px targets, tenant sync header, and floating Charge bar above thumb-reach navigation.</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
+## Frontend & State Architecture Deep-Dive
+
+Designed for high-throughput retail counters where network drops and UI jank directly cost revenue, `pos/` (`React 19` + strict `TypeScript 5.7` with `noUncheckedIndexedAccess` + `Tailwind CSS 4` + `IndexedDB`) isolates checkout ergonomics from network latency:
+
+```mermaid
+flowchart LR
+    subgraph UI["React 19 Counter UI"]
+        SELL["SellPage Terminal<br/>Keyboard Shortcuts and Cart Reducer"]
+        CAPS["Capability Gate<br/>useCapability and Lazy Modules"]
+        PILL["SyncPill Indicator<br/>Live Pending Outbox Count"]
+    end
+
+    subgraph EdgeStore["IndexedDB Edge Store"]
+        CAT[("catalog and products<br/>byBarcode Index · Server Wins")]
+        OUT[("outbox Queue<br/>clientUuid · Device Wins")]
+        KV[("kv Store<br/>Cached Capabilities and Sequence")]
+    end
+
+    subgraph SyncWorker["Background Sync Engine"]
+        LOOP["Coalesced Single-Flight Flusher<br/>Reconnect, Post-Sale, 30s Heartbeat"]
+    end
+
+    API["Express REST API<br/>POST /api/v1/sales/sync"]
+
+    SELL -->|Instant Barcode and Grid Reads| CAT
+    SELL -->|Zero-Network Sale Write| OUT
+    OUT -->|Immediate Badge Notify| PILL
+    OUT -->|Batched Up to 100 Sales| LOOP
+    LOOP -->|Idempotent UUID Sync| API
+    API -->|Purgeable Confirmed UUIDs| LOOP
+    LOOP -->|Atomic Outbox Purge| OUT
+    KV -->|Zero-Spinner Offline Boot| CAPS
+```
+
+- **Sub-100ms Checkout Latency (Zero-Network Write Path)**: Completing a checkout in [`SellPage.tsx`](pos/src/pages/SellPage.tsx) never blocks on HTTP. The terminal mints a device-local `clientUuid` (`crypto.randomUUID()`), an unguessable 12-char base36 `publicId` for instant WhatsApp receipt sharing, and a monotonic local receipt number (`nextLocalNumber()`), writes durably into the IndexedDB `outbox` store ([`db.ts`](pos/src/lib/db.ts)), renders the thermal/digital receipt immediately, and fires `notifyPendingChange()` + `flushOutbox()` in the background.
+- **Conflict-Free IndexedDB Ownership Model**: [`db.ts`](pos/src/lib/db.ts) splits local persistence into four stores (`catalog`, `products` with a `byBarcode` index, `outbox`, and `kv`) using strict directional ownership: catalog snapshots (including parent/child product variant metadata) flow **down** via atomic `readwrite` transactions (server wins), while sales flow **up** through an append-only outbox (device wins). Because catalog and outbox never write the same rows, offline partitions never create merge conflicts.
+- **Coalesced Single-Flight Idempotent Synchronization**: [`sync.ts`](pos/src/lib/sync.ts) batches up to 100 queued sales per `POST /api/v1/sales/sync` request on sale completion, browser `online` recovery, and a 30-second heartbeat. A single-flight lock paired with a `reflushRequested` coalescing flag ensures rapid back-to-back checkouts flush immediately without overlapping HTTP batches, while server-side `UNIQUE(orgId, clientUuid)` deduplication makes retries strictly idempotent and returns a `purgeable` UUID list for safe local deletion.
+- **Optimistic Zero-Spinner Boot & Stale-While-Revalidate Identity**: [`SessionProvider`](pos/src/state/store.tsx) hydrates cached tenant metadata, locale, and server-resolved capabilities directly from IndexedDB (`getCachedOrg()` + `kvGet('capabilities')`) on mount so a counter terminal boots straight into selling even with zero internet, then refreshes identity and catalog asynchronously with unmount cancellation guards (`shouldApply`).
+- **Keyboard-First & High-Throughput Counter Ergonomics**: [`SellPage.tsx`](pos/src/pages/SellPage.tsx) treats HID barcode scanners as native fast-typing keyboard streams (`Enter` triggers O(1) `findByBarcode()` IndexedDB index lookups), provides global keyboard shortcuts (`/` to focus search, `⌘/Ctrl+Enter` to trigger checkout, `Escape` to dismiss sheets), uses `useReducer` for deterministic cart mutations, memoizes category lookups with an O(1) `Map`, and enforces tabular figures (`tnum`) plus 48–56px touch targets.
+- **Multi-Tenant Server-Resolved Capability Gating & Code Splitting**: Terminals never branch on `org.businessType`. Instead, [`capabilities.ts`](pos/src/lib/capabilities.ts) and [`Capability.tsx`](pos/src/components/Capability.tsx) consume server-resolved capability flags (`stock.batches`, `stock.variants`, `loyalty`, `multi_branch`) and sell-screen layout configs (`quickCash`, `shell`, `scanFirst`), paired with `React.lazy` + `Suspense` route registration in [`registry.tsx`](pos/src/modules/registry.tsx) so tenants only download vertical chunks they are entitled to use.
+
+---
+
 ## System Architecture
 
 Sillara decouples point-of-sale checkout responsiveness from network reliability by running the active catalog and sales outbox inside IndexedDB on the client PWA, while enforcing financial integrity, tenant isolation, and idempotency at the MySQL relational layer.
@@ -194,6 +263,7 @@ sillara/
 │   └── workflows/
 │       └── ci.yml                 # Automated typecheck, build, Prisma & MySQL 8 integration CI
 ├── docs/
+│   ├── screenshots/               # High-DPI Desktop & Mobile POS UI captures
 │   ├── DEPLOY.md                  # VPS (Nginx + PM2 + MySQL) & Vercel deployment runbook
 │   ├── GUIDE.md                   # Complete architecture, API reference & operations guide
 │   ├── INSTALL-MAC.md             # Desktop PWA installation & offline verification guide
