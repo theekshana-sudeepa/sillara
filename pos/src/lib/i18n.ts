@@ -191,7 +191,11 @@ const ta: Dict = {
 
 const DICTS: Record<Lang, Dict> = { en, si, ta };
 
-let current: Lang = (localStorage.getItem('sillara.lang') as Lang) || 'en';
+export function toLang(value: string | null | undefined): Lang {
+  return value === 'si' || value === 'ta' ? value : 'en';
+}
+
+let current: Lang = toLang(localStorage.getItem('sillara.lang'));
 
 export function setLang(lang: Lang): void {
   current = lang;

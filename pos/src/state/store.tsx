@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useState } from 'react';
 import { api, getToken, setToken } from '@/lib/api';
-import { cacheBootstrap, getCachedOrg, kvGet, kvSet, type CachedOrg, type CachedProduct } from '@/lib/db';
-import { setLang, type Lang } from '@/lib/i18n';
+import { cacheBootstrap, getCachedOrg, kvGet, kvSet, type BootstrapPayload, type CachedOrg, type CachedProduct } from '@/lib/db';
+import { setLang, toLang } from '@/lib/i18n';
 import { DEFAULT_CAPABILITIES, type CapabilityId, type CapabilityState } from '@/lib/capabilities';
 
 // --- session ----------------------------------------------------------------
@@ -50,7 +50,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const refreshCatalog = useCallback(async () => {
-    const payload = await api.get<Parameters<typeof cacheBootstrap>[0] & { org: CachedOrg }>('/products/bootstrap');
+    const payload = await api.get<BootstrapPayload>('/products/bootstrap');
     await cacheBootstrap(payload);
   }, []);
 
@@ -61,18 +61,19 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
    * router goes down: a pharmacy that reboots offline must still open with
    * batch entry on the screen.
    */
-  const syncIdentity = useCallback(async (): Promise<void> => {
+  const syncIdentity = useCallback(async (shouldApply?: () => boolean): Promise<void> => {
     const me = await api.get<MeResponse>('/auth/me');
     const next: CapabilityState = {
       active: me.capabilities ?? DEFAULT_CAPABILITIES.active,
       blockedByPlan: me.blockedByPlan ?? [],
       layout: me.layout ?? DEFAULT_CAPABILITIES.layout,
     };
+    await kvSet('capabilities', next);
+    if (shouldApply && !shouldApply()) return;
     setSession({ user: me.user, org: me.org });
     setCapabilities(next);
-    setLang((me.org.language as Lang) ?? 'en');
+    setLang(toLang(me.org.language));
     setStatus('ready');
-    await kvSet('capabilities', next);
   }, []);
 
   /**
@@ -92,11 +93,11 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       if (cachedCaps && !cancelled) setCapabilities(cachedCaps);
       if (cachedOrg && !cancelled) {
         setSession({ user: { id: '', name: '', email: '', role: 'CASHIER' }, org: cachedOrg });
-        setLang((cachedOrg.language as Lang) ?? 'en');
+        setLang(toLang(cachedOrg.language));
         setStatus('ready');
       }
       try {
-        await syncIdentity();
+        await syncIdentity(() => !cancelled);
         if (cancelled) return;
         await refreshCatalog();
       } catch {
@@ -107,12 +108,12 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [refreshCatalog]);
+  }, [refreshCatalog, syncIdentity]);
 
   const signIn = useCallback((token: string, s: Session) => {
     setToken(token);
     setSession(s);
-    setLang((s.org.language as Lang) ?? 'en');
+    setLang(toLang(s.org.language));
     setStatus('ready');
     // The login response carries a session but not the till's shape; fetch it
     // before the catalogue so the sell screen mounts the right shell.

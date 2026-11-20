@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useCart, useSession } from '@/state/store';
+import { useCart, useLayout, useSession } from '@/state/store';
 import { findByBarcode, getCachedCategories, getCachedProducts, onCatalogChange, mintPublicId, nextLocalNumber, queueSale, type CachedCategory, type CachedProduct } from '@/lib/db';
-import { flushOutbox } from '@/lib/sync';
+import { flushOutbox, notifyPendingChange } from '@/lib/sync';
 import { money } from '@/lib/format';
 import { t } from '@/lib/i18n';
 import { Receipt, type ReceiptData } from '@/components/Receipt';
@@ -16,6 +16,7 @@ type Tender = 'CASH' | 'CARD' | 'QR';
 export default function SellPage() {
   const { session, online } = useSession();
   const { cart, dispatch, total, subtotal } = useCart();
+  const layout = useLayout();
 
   const [products, setProducts] = useState<CachedProduct[]>([]);
   const [categories, setCategories] = useState<CachedCategory[]>([]);
@@ -88,6 +89,12 @@ export default function SellPage() {
       .filter((p) => (q ? p.name.toLowerCase().includes(q) || p.sku?.toLowerCase().includes(q) || p.barcode?.includes(q) : true))
       .slice(0, 120);
   }, [products, activeCategory, search]);
+
+  /** O(1) category lookup for product tiles so large catalogs render without O(N*M) scans. */
+  const categoryById = useMemo(
+    () => new Map(categories.map((c) => [c.id, c])),
+    [categories],
+  );
 
   /** Children of the parent currently being picked, from the same cache. */
   const pickingVariants = useMemo(
@@ -174,16 +181,53 @@ export default function SellPage() {
     setTendered('');
     setCustomer(null);
     setRedeemPoints(0);
+    // Notify the SyncPill immediately so offline terminals show the queued
+    // count right away before the async flush (or offline wait) settles.
+    void notifyPendingChange();
     void flushOutbox();
   };
 
-  // Fast-cash denominations adapt to the currency's magnitude.
+  // Keyboard-first till ergonomics:
+  //   /            → focus barcode/product search from anywhere
+  //   Escape       → dismiss the topmost sheet or receipt
+  //   ⌘/Ctrl+Enter → open the payment sheet when a basket is ready
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const inInput = target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable;
+
+      if (e.key === 'Escape') {
+        if (receipt) { setReceipt(null); searchRef.current?.focus(); }
+        else if (payOpen) setPayOpen(false);
+        else if (picking) setPicking(null);
+        else if (pickerOpen) setPickerOpen(false);
+        else if (shiftOpen) setShiftOpen(false);
+        return;
+      }
+
+      if (e.key === '/' && !inInput && !payOpen && !picking && !pickerOpen && !shiftOpen && !receipt) {
+        e.preventDefault();
+        searchRef.current?.focus();
+        return;
+      }
+
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !payOpen && !paused && cart.lines.length > 0) {
+        e.preventDefault();
+        setPayOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [cart.lines.length, paused, payOpen, pickerOpen, picking, receipt, shiftOpen]);
+
+  // Fast-cash denominations use server-resolved layout config, falling back to currency magnitude.
   const quickCash = useMemo(() => {
-    const bills = currency === 'LKR' ? [100, 500, 1000, 5000] : [1, 5, 10, 20, 50, 100];
+    const defaultBills = currency === 'LKR' ? [100, 500, 1000, 5000] : [1, 5, 10, 20, 50, 100];
+    const bills = layout.quickCash.length > 0 ? layout.quickCash : defaultBills;
     const exact = Math.ceil(payable);
     const ups = bills.filter((b) => b >= payable).slice(0, 3);
     return [...new Set([exact, ...ups])].slice(0, 4);
-  }, [currency, payable]);
+  }, [currency, layout.quickCash, payable]);
 
   const cartCount = cart.lines.reduce((s, l) => s + l.qty, 0);
 
@@ -310,7 +354,7 @@ export default function SellPage() {
             </div>
           ) : (
             visible.map((p) => {
-              const cat = categories.find((c) => c.id === p.categoryId);
+              const cat = p.categoryId ? categoryById.get(p.categoryId) : undefined;
               const out = p.trackStock && p.stockQty <= 0;
               return (
                 <button
@@ -458,9 +502,9 @@ export default function SellPage() {
         </div>
       </aside>
 
-      {/* ---- phone charge bar: sits ABOVE the tab bar, never over it ---- */}
+      {/* ---- phone charge bar: sits flush ABOVE the tab bar, never over it ---- */}
       {cart.lines.length > 0 ? (
-        <div className="sheet-in fixed inset-x-0 bottom-[calc(env(safe-area-inset-bottom)+58px)] z-20 border-t border-border bg-surface px-3 py-2.5 shadow-[0_-6px_20px_-8px_hsl(240_40%_5%/0.25)] lg:hidden">
+        <div className="sheet-in fixed inset-x-0 bottom-[calc(env(safe-area-inset-bottom)+51px)] z-20 border-t border-border bg-surface px-3 py-2.5 shadow-[0_-6px_20px_-8px_hsl(240_40%_5%/0.25)] lg:hidden">
           <button
             onClick={() => setPayOpen(true)}
             disabled={paused}

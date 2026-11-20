@@ -143,14 +143,53 @@ export function onCatalogChange(fn: () => void): () => void {
   return () => window.removeEventListener(CATALOG_EVENT, fn);
 }
 
-export async function cacheBootstrap(payload: {
+export interface CachedStaff {
+  id: string;
+  name: string;
+  role: 'OWNER' | 'MANAGER' | 'CASHIER';
+}
+
+export interface CachedRegister {
+  id: string;
+  name: string;
+  branchId?: string | null;
+  isActive?: boolean;
+}
+
+export interface CachedCustomer {
+  id: string;
+  name: string;
+  phone: string | null;
+  loyaltyPoints: number;
+}
+
+export interface BootstrapProduct {
+  id: string;
+  categoryId?: string | null;
+  name: string;
+  price: number | string;
+  barcode?: string | null;
+  sku?: string | null;
+  unit?: string | null;
+  trackStock?: boolean;
+  stockQty?: number | string | null;
+  isActive?: boolean;
+  parentId?: string | null;
+  variantAttributes?: Record<string, string> | null;
+  variantOptions?: Array<{ name: string; values: string[] }> | null;
+}
+
+export interface BootstrapPayload {
   org: CachedOrg;
   categories: CachedCategory[];
-  products: Array<Record<string, unknown>>;
-  staff: unknown[];
-  registers: unknown[];
-  customers: unknown[];
-}): Promise<void> {
+  products: BootstrapProduct[];
+  staff: CachedStaff[];
+  registers: CachedRegister[];
+  customers: CachedCustomer[];
+  syncedAt?: string;
+}
+
+export async function cacheBootstrap(payload: BootstrapPayload): Promise<void> {
   const database = await db();
   const tx = database.transaction(['catalog', 'products'], 'readwrite');
   await tx.objectStore('catalog').put(payload.org, 'org');
@@ -158,22 +197,25 @@ export async function cacheBootstrap(payload: {
   await tx.objectStore('catalog').put(payload.staff, 'staff');
   await tx.objectStore('catalog').put(payload.registers, 'registers');
   await tx.objectStore('catalog').put(payload.customers, 'customers');
-  await tx.objectStore('catalog').put(new Date().toISOString(), 'syncedAt');
+  await tx.objectStore('catalog').put(payload.syncedAt ?? new Date().toISOString(), 'syncedAt');
 
   const store = tx.objectStore('products');
   await store.clear();
   for (const p of payload.products) {
     await store.put({
       id: String(p.id),
-      categoryId: (p.categoryId as string | null) ?? null,
+      categoryId: p.categoryId ?? null,
       name: String(p.name),
       price: Number(p.price),
-      barcode: (p.barcode as string | null) ?? null,
-      sku: (p.sku as string | null) ?? null,
-      unit: String(p.unit ?? 'pc'),
+      barcode: p.barcode ?? null,
+      sku: p.sku ?? null,
+      unit: p.unit ?? 'pc',
       trackStock: Boolean(p.trackStock),
       stockQty: Number(p.stockQty ?? 0),
-      isActive: Boolean(p.isActive),
+      isActive: p.isActive ?? true,
+      parentId: p.parentId ?? null,
+      variantAttributes: p.variantAttributes ?? null,
+      variantOptions: p.variantOptions ?? null,
     });
   }
   await tx.done;

@@ -1,12 +1,27 @@
 const BASE = import.meta.env.VITE_API_URL ?? '';
 const API = `${BASE}/api/v1`;
 
+export interface ApiErrorDetail {
+  field: string;
+  message: string;
+}
+
+interface ApiEnvelope<T> {
+  ok: boolean;
+  data: T;
+  error?: {
+    code: string;
+    message: string;
+    details?: ApiErrorDetail[];
+  };
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
     message: string,
-    readonly details?: Array<{ field: string; message: string }>,
+    readonly details?: ApiErrorDetail[],
   ) {
     super(message);
     this.name = 'ApiError';
@@ -42,7 +57,7 @@ async function request<T>(path: string, options: { method?: string; body?: unkno
     body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
   });
 
-  const json = (await res.json().catch(() => null)) as { ok: boolean; data: T; error?: { code: string; message: string; details?: never } } | null;
+  const json = (await res.json().catch(() => null)) as ApiEnvelope<T> | null;
   if (!res.ok || !json?.ok) {
     if (res.status === 401) setToken(null);
     throw new ApiError(res.status, json?.error?.code ?? 'REQUEST_FAILED', json?.error?.message ?? res.statusText, json?.error?.details);

@@ -137,7 +137,7 @@ export default function StockPage() {
       await load();
       await refreshCatalog().catch(() => {});
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : (err as Error).message);
+      setError(err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'Could not update stock');
     } finally {
       setBusy(false);
     }

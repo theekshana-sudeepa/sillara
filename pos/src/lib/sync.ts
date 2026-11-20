@@ -1,17 +1,35 @@
 import { api } from './api';
 import { bumpAttempts, pendingSales, purgeSales, kvSet } from './db';
 
+type SyncSaleStatus = 'created' | 'duplicate' | 'failed';
+
+interface SyncSaleResult {
+  clientUuid: string;
+  status: SyncSaleStatus;
+  receiptNumber?: number;
+  error?: string;
+}
+
+interface SyncBatchResponse {
+  purgeable: string[];
+  results: SyncSaleResult[];
+}
+
 /**
  * Outbox flush. Called: on reconnect, after every sale, and every 30s while
  * pending rows exist. Server-side UUID dedupe makes over-flushing free —
  * the worst case is a no-op response listing already-synced UUIDs.
  */
 let flushing = false;
+let reflushRequested = false;
 const listeners = new Set<(pending: number) => void>();
 
 export function onPendingChange(fn: (pending: number) => void): () => void {
   listeners.add(fn);
-  return () => listeners.delete(fn);
+  void notify();
+  return () => {
+    listeners.delete(fn);
+  };
 }
 
 async function notify(): Promise<void> {
@@ -20,7 +38,13 @@ async function notify(): Promise<void> {
 }
 
 export async function flushOutbox(): Promise<{ synced: number; failed: number }> {
-  if (flushing || !navigator.onLine) return { synced: 0, failed: 0 };
+  if (!navigator.onLine) return { synced: 0, failed: 0 };
+  if (flushing) {
+    // A rapid consecutive checkout landed mid-flight; coalesce one immediate
+    // follow-up flush instead of waiting for the 30s interval timer.
+    reflushRequested = true;
+    return { synced: 0, failed: 0 };
+  }
   flushing = true;
   try {
     const pending = await pendingSales();
@@ -42,10 +66,7 @@ export async function flushOutbox(): Promise<{ synced: number; failed: number }>
       soldAt: s.soldAt,
     }));
 
-    const result = await api.post<{ purgeable: string[]; results: Array<{ clientUuid: string; status: string }> }>(
-      '/sales/sync',
-      { sales: batch },
-    );
+    const result = await api.post<SyncBatchResponse>('/sales/sync', { sales: batch });
 
     await purgeSales(result.purgeable);
     const failed = result.results.filter((r) => r.status === 'failed').map((r) => r.clientUuid);
@@ -59,6 +80,10 @@ export async function flushOutbox(): Promise<{ synced: number; failed: number }>
     return { synced: 0, failed: 0 };
   } finally {
     flushing = false;
+    if (reflushRequested && navigator.onLine) {
+      reflushRequested = false;
+      void flushOutbox();
+    }
   }
 }
 

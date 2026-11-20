@@ -98,7 +98,7 @@ const TABS: Array<{ to: string; label: string; icon: IconName }> = [
  * muscle memory beats adaptive cleverness on a device used 600 times a day.
  */
 function Shell() {
-  const { online } = useSession();
+  const { online, session } = useSession();
   const [pending, setPending] = useState(0);
 
   useEffect(() => {
@@ -112,6 +112,27 @@ function Shell() {
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      {/* ---- mobile / tablet header: tenant context + sync state without overlapping page actions ---- */}
+      <header className="flex shrink-0 items-center justify-between gap-2 border-b border-border bg-surface px-3 py-2 lg:hidden">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="grid size-7 shrink-0 place-items-center rounded-lg bg-primary shadow-e1" aria-hidden>
+            <svg width="15" height="15" viewBox="0 0 32 32">
+              <path
+                d="M21.5 11c0-2-1.8-3.5-5.5-3.5S10.5 9 10.5 11s2 2.8 5.5 3.5 5.5 1.5 5.5 3.5-1.8 3.5-5.5 3.5-5.5-1.5-5.5-3.5"
+                stroke="hsl(var(--primary-foreground))"
+                strokeWidth="2.8"
+                fill="none"
+                strokeLinecap="round"
+              />
+            </svg>
+          </div>
+          <span className="truncate text-[13.5px] font-bold tracking-[-0.01em]">
+            {session?.org.name ?? 'Sillara POS'}
+          </span>
+        </div>
+        <SyncPill online={online} pending={pending} />
+      </header>
+
       {/* ---- desktop rail: always visible, never in the way ------------- */}
       <nav
         aria-label="Main"
@@ -190,11 +211,6 @@ function Shell() {
           </NavLink>
         ))}
       </nav>
-
-      {/* On a phone the rail is hidden, so sync state rides the top-right. */}
-      <div className="pointer-events-none fixed right-2 top-2 z-30 lg:hidden">
-        <SyncPill online={online} pending={pending} />
-      </div>
     </div>
   );
 }
